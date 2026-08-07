@@ -375,12 +375,11 @@ struct PopoverView: View {
                 ForEach(ClaudeModel.allCases, id: \.self) { model in
                     Text(model.label).tag(Optional(model))
                 }
-                // Claude Code accepts values this picker does not offer
-                // (`opusplan`, `sonnet[1m]`). Showing the real one keeps the
-                // control honest instead of reading as though nothing is set.
-                if store.model == nil {
-                    Text(store.modelRaw ?? "—").tag(ClaudeModel?.none)
-                }
+                // No option for "unset" or for a value we do not offer. A
+                // selection matching no tag simply highlights nothing, which is
+                // the honest rendering — a placeholder chip would be selectable
+                // and would mean nothing when clicked. The caption below says
+                // what is actually set.
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -388,10 +387,22 @@ struct PopoverView: View {
             .fixedSize()
         }
 
-        Text("applies to new sessions — open ones keep their model")
+        Text(modelCaption)
             .font(Theme.caption)
             .foregroundStyle(Theme.inkTertiary)
             .lineLimit(1)
+    }
+
+    /// Names the setting when it is one the chips cannot show, so an unhighlighted
+    /// row reads as "set to something else" rather than as broken.
+    private var modelCaption: String {
+        guard store.model == nil else {
+            return "applies to new sessions — open ones keep their model"
+        }
+        guard let raw = store.modelRaw else {
+            return "unset — Claude Code picks the default for each account"
+        }
+        return "set to \(raw) — applies to new sessions"
     }
 
     /// Says what the switch is actually doing right now, not what it does in

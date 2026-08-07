@@ -5,14 +5,19 @@ import Foundation
 /// Aliases, never full model ids: `claude-opus-4-6-20260115` and its siblings are
 /// dated strings that go stale on every release, whereas `opus` is resolved by
 /// Claude Code at read time and keeps meaning "the newest Opus this account can
-/// reach". Claude Code accepts more than these three (`best`, `opusplan`, `fable`,
-/// and `[1m]` context variants); the switcher deliberately offers only the tiers
-/// that map to a usage decision.
+/// reach". Claude Code accepts more than these four (`best`, `opusplan`, and the
+/// `[1m]` context variants); the switcher deliberately offers only the tiers that
+/// map to a usage decision.
+///
+/// Not every account is entitled to every tier. An unentitled value is not a
+/// failure state — Claude Code falls back to the tier default and says so — so
+/// the picker offers the range rather than trying to predict the entitlement.
 enum ClaudeModel: String, CaseIterable, Sendable {
-    case opus, sonnet, haiku
+    case fable, opus, sonnet, haiku
 
     var label: String {
         switch self {
+        case .fable:  return "Fable"
         case .opus:   return "Opus"
         case .sonnet: return "Sonnet"
         case .haiku:  return "Haiku"
