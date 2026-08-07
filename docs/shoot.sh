@@ -88,6 +88,12 @@ echo "==> render"
 HEADROOM_HOME="$FIXTURE" "$BIN" --render "$RAW" >/dev/null
 say "$(ls "$RAW" | tr '\n' ' ')"
 
+# The icon comes out of the same binary as the UI, so regenerate it here too --
+# otherwise the README and the social card can go on showing a mark the app no
+# longer draws.
+"$BIN" --icon "$WORK" >/dev/null
+cp "$WORK/Headroom.iconset/icon_512x512.png" "$DOCS/icon.png"
+
 echo "==> frame"
 for mode in light dark; do
     bg=$LIGHT_BG rim=$LIGHT_RIM

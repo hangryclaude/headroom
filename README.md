@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/icon.png" width="104" alt="Headroom's app icon: a tank filled from the bottom with a pace mark above the fill">
+<img src="docs/icon.png" width="104" alt="Headroom's app icon: a tank filled from the bottom with a pace notch cut into the right edge">
 
 # Headroom
 
