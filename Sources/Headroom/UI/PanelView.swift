@@ -240,11 +240,18 @@ private struct Row: View {
         self.value = value
     }
 
+    /// Each section is its own `Grid`, so each would otherwise size its label
+    /// column to its own longest label — and the values would step left and
+    /// right down the panel. A fixed measure, wide enough for the longest label
+    /// on any section, makes one column out of all of them.
+    static let labelWidth: CGFloat = 116
+
     var body: some View {
         GridRow {
             Text(label)
                 .font(Theme.body)
                 .foregroundStyle(Theme.inkTertiary)
+                .frame(width: Self.labelWidth, alignment: .leading)
             Text(value)
                 .font(Theme.value)
                 .foregroundStyle(Theme.ink)

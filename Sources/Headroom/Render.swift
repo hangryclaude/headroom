@@ -15,6 +15,7 @@ enum Render {
         _ = NSApplication.shared
 
         let store = Store()
+        settle(store)
         let view = PopoverView(store: store, onQuit: {}, onRefresh: {}, onAddAccount: {}, onOpenPanel: {})
 
         for (name, appearance) in [("dark", NSAppearance.Name.darkAqua),
@@ -34,6 +35,27 @@ enum Render {
             write(OnboardingView(store: store, onFinish: {}).frame(width: 720, height: 520),
                   appearance: appearance, to: onboardingURL)
             print("wrote \(onboardingURL.path)")
+        }
+    }
+
+    /// Waits for the transcript scan so the panel's cost section has something
+    /// in it.
+    ///
+    /// A freshly constructed `Store` has read the quota cache but not the
+    /// transcripts, and the scan is deliberately off-main. Capturing immediately
+    /// therefore always photographs "measuring — no requests indexed yet", which
+    /// is the one part of the panel a screenshot most needs to show.
+    ///
+    /// Spinning the run loop rather than blocking on a semaphore: `Store` is
+    /// `@MainActor` and this binary links AppKit, so its continuations are
+    /// scheduled on this very thread. Blocking it would guarantee they never run.
+    private static func settle(_ store: Store, timeout: TimeInterval = 20) {
+        store.start()
+        defer { store.stop() }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while store.tokens24h.total == 0 && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
         }
     }
 
