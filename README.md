@@ -15,7 +15,7 @@ Swift 6 · SwiftUI · AppKit · no dependencies · macOS 14+ (Apple silicon)
 <div align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/popover-dark.png">
-  <img src="docs/popover-light.png" width="470" alt="Headroom's menu bar dropdown: the week at 74% with a pace mark, the 5-hour window at 43%, a Fable cap at 18%, three saved accounts, an auto-swap switch and a model picker">
+  <img src="docs/popover-light.png" width="480" alt="Headroom's menu bar dropdown: the week at 74% with a pace mark, the 5-hour window at 43%, a Fable cap at 18%, three saved accounts, an auto-swap switch and a model picker">
 </picture>
 </div>
 
@@ -54,7 +54,7 @@ Or take the `.dmg` from [Releases](../../releases) and drag Headroom to Applicat
 <div align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/instrument-dark.png">
-  <img src="docs/instrument-light.png" width="620" alt="The header: WEEK USED 74% in amber with a graduated meter and a pace mark at 61%, SESSION 43% and FABLE 18% beside it, then 'refills in 2d 16h', the 24-hour token count and cost, and 'read 4m ago'">
+  <img src="docs/instrument-light.png" width="476" alt="The header: WEEK USED 74% in amber with a graduated meter and a pace mark at 61%, SESSION 43% and FABLE 18% beside it, then 'refills in 2d 16h', the 24-hour token count and cost, and 'read 4m ago'">
 </picture>
 </div>
 

@@ -113,16 +113,18 @@ for mode in light dark; do
     # The detail panel is ~1900px tall, which in a README is a column nobody
     # reads. Split it at the cost section and set the halves side by side.
     #
-    # The upper half is shorter, so its canvas is extended to the lower half's
-    # height before framing. Two panes of equal size read as one surface split in
-    # two; a short card beside a tall one reads as a mistake.
+    # Both halves are cut so their first section label sits 61px below the card
+    # top, which is the inset the panel already uses -- otherwise the right
+    # column's heading starts higher than the left's and the pair looks
+    # misregistered. Each half ends 61px after its own last row, so neither card
+    # carries a slab of dead space. They come out different heights, which is
+    # what two columns of a document do.
     #
-    # These offsets are measured off the render, so a layout change moves them.
-    # The banner below prints every output's dimensions for exactly that reason.
-    magick "$RAW/panel-$mode.png" -crop "920x878+0+0" +repage \
-        -background "$bg" -gravity north -extent 920x1034 \
+    # Measured off the render, so a layout change moves them. The banner below
+    # prints every output's dimensions for exactly that reason.
+    magick "$RAW/panel-$mode.png" -crop "920x906+0+0" +repage \
         -strip "$WORK/panel-top-$mode.png"
-    magick "$RAW/panel-$mode.png" -crop "920x1034+0+878" +repage \
+    magick "$RAW/panel-$mode.png" -crop "920x1050+0+851" +repage \
         -strip "$WORK/panel-bottom-$mode.png"
     frame "$WORK/panel-top-$mode.png" "$WORK/f-panel-top-$mode.png" "$bg" "$rim" "$RADIUS" 24
     frame "$WORK/panel-bottom-$mode.png" "$WORK/f-panel-bottom-$mode.png" "$bg" "$rim" "$RADIUS" 24
