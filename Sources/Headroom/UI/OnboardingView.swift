@@ -22,13 +22,23 @@ struct OnboardingView: View {
         static let bottom: CGFloat = 32
         static let title: CGFloat = 30
         static let subtitle: CGFloat = 22
+        /// The widest the text column is allowed to get. Prose set across a
+        /// 27-inch display is unreadable however much room there is.
+        static let measure: CGFloat = 720
     }
 
     @State private var model: OnboardingModel
     @FocusState private var codeFocused: Bool
 
-    init(store: Store, onFinish: @escaping () -> Void) {
+    /// Lets the window follow the flow: full screen to introduce and to finish,
+    /// a corner panel while the browser is the thing that matters.
+    private let onStepChange: ((OnboardingModel.Step) -> Void)?
+
+    init(store: Store,
+         onStepChange: ((OnboardingModel.Step) -> Void)? = nil,
+         onFinish: @escaping () -> Void) {
         _model = State(initialValue: OnboardingModel(store: store, onFinish: onFinish))
+        self.onStepChange = onStepChange
     }
 
     var body: some View {
@@ -48,7 +58,11 @@ struct OnboardingView: View {
         .padding(.horizontal, Page.side)
         .padding(.top, Page.top)
         .padding(.bottom, Page.bottom)
-        .frame(width: 720, height: 520, alignment: .topLeading)
+        // A measure, not a window size. Full screen the content still has to
+        // stop at a readable line length; what grows is the space around it.
+        .frame(maxWidth: Page.measure, alignment: .topLeading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .onChange(of: model.step) { _, step in onStepChange?(step) }
         .onDisappear { model.stopWatchingClipboard() }
     }
 

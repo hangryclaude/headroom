@@ -9,9 +9,9 @@ import SwiftUI
 /// annoying. `.floating` removes the whole failure class for the cost of one
 /// line.
 ///
-/// Fixed size and not resizable: every screen here is laid out to a 624pt
-/// measure, and there is nothing on any of them that a taller window would show
-/// more of.
+/// The frame follows the step rather than staying put — see `applyFrame`. Full
+/// screen to introduce and to finish; a corner panel for the one step that has
+/// to share the display with a browser.
 @MainActor
 final class OnboardingWindow: NSObject, NSWindowDelegate {
 
@@ -76,10 +76,49 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         // owned by this object — a strong capture closes the loop and neither
         // ever goes away.
         window.contentView = NSHostingView(
-            rootView: OnboardingView(store: store) { [weak self] in self?.close() }
+            rootView: OnboardingView(
+                store: store,
+                onStepChange: { [weak self] step in self?.move(to: step) },
+                onFinish: { [weak self] in self?.close() }
+            )
         )
-        window.center()
+        applyFrame(for: .welcome, to: window, animate: false)
         return window
+    }
+
+    /// The walkthrough opens and closes filling the screen, and gets out of the
+    /// way in between.
+    ///
+    /// Covering the screen is the right frame for the two steps that are only
+    /// about reading — nothing competes with them. It is the wrong frame for the
+    /// paste step, which needs the browser and this window legible at the same
+    /// moment: full screen either hides the page holding the code or ends up
+    /// behind it, and `.accessory` apps have no Dock icon or ⌘-Tab entry to dig a
+    /// buried window back out. So that one step shrinks to a corner instead.
+    private func move(to step: OnboardingModel.Step) {
+        guard let window else { return }
+        applyFrame(for: step, to: window, animate: true)
+    }
+
+    private func applyFrame(for step: OnboardingModel.Step, to window: NSWindow, animate: Bool) {
+        // `.main` is the screen with the key window, which during this flow can
+        // be the browser's. The walkthrough should stay where it opened.
+        let screen = window.screen ?? NSScreen.main ?? NSScreen.screens[0]
+        let visible = screen.visibleFrame
+
+        switch step {
+        case .welcome, .done:
+            window.setFrame(visible, display: true, animate: animate)
+        case .paste:
+            let size = NSSize(width: 460, height: 520)
+            let inset: CGFloat = 24
+            let frame = NSRect(
+                x: visible.maxX - size.width - inset,
+                y: visible.maxY - size.height - inset,
+                width: size.width,
+                height: size.height)
+            window.setFrame(frame, display: true, animate: animate)
+        }
     }
 
     // MARK: NSWindowDelegate
