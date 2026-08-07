@@ -35,7 +35,7 @@ Two tools sit either side of this one. SessionWatcher reads quota well but canno
 ## Install
 
 ```sh
-git clone https://github.com/hangryclaude/headroom.git
+git clone https://github.com/angusbuilds/headroom.git
 cd headroom && ./install.sh
 ```
 

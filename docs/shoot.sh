@@ -157,7 +157,7 @@ if [[ -f $SF ]]; then
         -font "$SF" -fill "#A19C95" -pointsize 29 \
             -annotate +76+394 "One click swaps between your Claude accounts." \
         -font "$SF" -fill "#615C57" -pointsize 24 \
-            -annotate +76+566 "github.com/hangryclaude/headroom" \
+            -annotate +76+566 "github.com/angusbuilds/headroom" \
         \( "$WORK/social-inset.png" \) -gravity southeast -geometry +-26+-24 \
             -compose Over -composite \
         -define png:color-type=6 -strip "$DOCS/social-preview.png"
