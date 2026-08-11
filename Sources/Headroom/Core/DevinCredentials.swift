@@ -38,8 +38,10 @@ enum DevinCredentials {
         Keychain.exists(service: keychainService, account: Keychain.defaultAccount)
     }
 
-    static func readKey() throws -> String {
-        let data = try Keychain.read(service: keychainService, account: Keychain.defaultAccount)
+    static func readKey(allowInteraction: Bool = true) throws -> String {
+        let data = try Keychain.read(service: keychainService,
+                                     account: Keychain.defaultAccount,
+                                     allowInteraction: allowInteraction)
         guard let key = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty
         else { throw DevinClient.Failure.noKey }

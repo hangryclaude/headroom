@@ -169,7 +169,11 @@ final class Store {
 
     /// Devin's session list. Skipped entirely when unconfigured, so an install
     /// that never touches Devin makes no requests and shows no section.
-    func refreshDevin(force: Bool = false) async {
+    /// `allowKeychainPrompt` defaults off because the poll on the timer must
+    /// never summon a confidential-information dialog over whatever the user is
+    /// doing. Only the dropdown -- where the user just asked for this data --
+    /// passes true.
+    func refreshDevin(force: Bool = false, allowKeychainPrompt: Bool = false) async {
         if loadDevinFixture() { return }
 
         guard DevinCredentials.isConfigured else {
@@ -185,10 +189,12 @@ final class Store {
         defer { isFetchingDevin = false }
 
         guard let orgID = DevinCredentials.orgID,
-              let key = try? DevinCredentials.readKey() else {
-            // hasKey said yes but the read failed, which on this path means the
-            // user denied the Keychain prompt. Say that rather than showing zero.
-            devinError = "Keychain access denied"
+              let key = try? DevinCredentials.readKey(allowInteraction: allowKeychainPrompt) else {
+            // hasKey said yes but the read failed. With the prompt allowed that
+            // means the user denied it; without it, access simply is not granted
+            // yet and opening the dropdown will ask. Either way, say so rather
+            // than showing zero sessions as though the org were empty.
+            devinError = allowKeychainPrompt ? "Keychain access denied" : "Open to load"
             return
         }
 

@@ -398,7 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // First read of the Devin key prompts; opening the dropdown is the
         // moment the user is asking for this data, so it is where the prompt
         // belongs. TTL-gated, so this is one request every five minutes at most.
-        Task { await store.refreshDevin() }
+        Task { await store.refreshDevin(allowKeychainPrompt: true) }
 
         let menu = NSMenu()
         menu.delegate = self
