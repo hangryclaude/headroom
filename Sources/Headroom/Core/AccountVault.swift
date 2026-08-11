@@ -4,6 +4,11 @@ struct StoredAccount: Codable, Identifiable, Equatable {
     var name: String
     var email: String?
     var plan: String?
+    /// The raw tier, e.g. `default_claude_max_20x`, kept alongside the humanised
+    /// `plan` label because pricing has to key off something stable. The label is
+    /// for reading; this is for arithmetic. Optional so existing vault files
+    /// decode unchanged and fill in on the next identity refresh.
+    var rateLimitTier: String?
     var accountUUID: String?
     /// SHA-256 over the access + refresh tokens. Identifies which vault slot is
     /// currently installed without keeping a pointer that can desync.
@@ -140,8 +145,8 @@ final class AccountVault: @unchecked Sendable {
 
     // MARK: Credentials
 
-    private func currentCredentials() throws -> Credentials {
-        Credentials(raw: try Keychain.read())
+    private func currentCredentials(allowInteraction: Bool = true) throws -> Credentials {
+        Credentials(raw: try Keychain.read(allowInteraction: allowInteraction))
     }
 
     private func credentialURL(_ name: String) -> URL {
@@ -190,8 +195,54 @@ final class AccountVault: @unchecked Sendable {
     /// Access token for an account, for the usage endpoint. The active account is
     /// read live so a token Claude Code just refreshed is used rather than the
     /// vault's older copy.
+    ///
+    /// **This can block.** Reading the live credential goes through the Keychain,
+    /// which raises a macOS authorisation dialog the first time each build asks --
+    /// and the grant is tied to the binary, so every rebuild re-prompts. Fine for
+    /// a swap, where the user initiated something and a fresh token is the whole
+    /// point. Use `storedAccessToken` anywhere that must not stall.
     func accessToken(for account: StoredAccount) -> String? {
         credentials(for: account)?.accessToken
+    }
+
+    /// Access token from the vault's own copy, never the Keychain.
+    ///
+    /// Read-only reporting commands use this deliberately. A command whose entire
+    /// job is printing a table must never block on a modal dialog the user may
+    /// not even be looking at -- and it did, once, which is why this exists. The
+    /// cost is that the active account's copy can be older than the live one, so
+    /// a stale token reports as unreachable rather than silently prompting.
+    func storedAccessToken(for account: StoredAccount) -> String? {
+        storedCredentials(account.name)?.accessToken
+    }
+
+    /// Fills in an account's email, plan, and UUID without touching its tokens.
+    ///
+    /// This is the repair path for accounts added before the sign-in flow asked
+    /// the profile endpoint for a plan tier: those were stored with no plan at
+    /// all, and re-logging in four accounts to fix a label would be an absurd
+    /// price. The credential is not read or rewritten, so the fingerprint stays
+    /// put and there is no way for this to disturb a token.
+    ///
+    /// - Returns: false when another account already holds this UUID. That is a
+    ///   refusal, not a failure — writing it would leave two slots claiming one
+    ///   account, which is exactly the confusion that got a live account's
+    ///   consumed refresh token replayed. The caller reports it; nothing changes.
+    func updateIdentity(_ identity: Identity, for name: String) throws -> Bool {
+        var list = accounts()
+        guard let index = list.firstIndex(where: { $0.name == name }) else {
+            throw VaultError.unknownAccount(name)
+        }
+        if list.contains(where: { $0.accountUUID == identity.accountUUID && $0.name != name }) {
+            return false
+        }
+
+        list[index].email = identity.email
+        list[index].plan = identity.planLabel
+        list[index].rateLimitTier = identity.rateLimitTier
+        list[index].accountUUID = identity.accountUUID
+        try write(list)
+        return true
     }
 
     // MARK: Capture
@@ -229,6 +280,7 @@ final class AccountVault: @unchecked Sendable {
             name: name,
             email: identity?.email,
             plan: identity?.planLabel,
+            rateLimitTier: identity?.rateLimitTier,
             accountUUID: identity?.accountUUID,
             fingerprint: credentials.fingerprint,
             savedAt: Date(),
@@ -272,6 +324,7 @@ final class AccountVault: @unchecked Sendable {
             name: name,
             email: identity?.email,
             plan: identity?.planLabel,
+            rateLimitTier: identity?.rateLimitTier,
             accountUUID: identity?.accountUUID,
             fingerprint: credentials.fingerprint,
             savedAt: Date(),
@@ -316,7 +369,9 @@ final class AccountVault: @unchecked Sendable {
 
     /// Moves to `name`. Returns the account now installed.
     @discardableResult
-    func activate(_ name: String, force: Bool = false) throws -> StoredAccount {
+    func activate(
+        _ name: String, force: Bool = false, allowKeychainPrompt: Bool = true
+    ) throws -> StoredAccount {
         var list = accounts()
         guard let targetIndex = list.firstIndex(where: { $0.name == name }) else {
             throw VaultError.unknownAccount(name)
@@ -344,7 +399,7 @@ final class AccountVault: @unchecked Sendable {
         // get to replace it.
         let live: Credentials
         do {
-            live = try currentCredentials()
+            live = try currentCredentials(allowInteraction: allowKeychainPrompt)
         } catch {
             throw VaultError.cannotReadOutgoing(String(describing: error))
         }
@@ -379,7 +434,7 @@ final class AccountVault: @unchecked Sendable {
             try persist(live, for: Self.unsavedSlot)
         }
 
-        try Keychain.write(target.raw)
+        try Keychain.write(target.raw, allowInteraction: allowKeychainPrompt)
         try Self.repointConfig()
 
         list[targetIndex].lastActiveAt = Date()

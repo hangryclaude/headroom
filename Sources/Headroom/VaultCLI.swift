@@ -71,8 +71,12 @@ enum VaultCLI {
             importBlob(vault, name: rest[0], path: rest[1])
         case "usage":
             usage(vault)
+        case "refresh-identity":
+            refreshIdentity(vault)
+        case "waste":
+            waste(vault)
         default:
-            print("usage: Headroom --vault <status|list|login <name>|import <name> <file>|save <name>|switch <name>|forget <name>|usage>")
+            print("usage: Headroom --vault <status|list|login <name>|import <name> <file>|save <name>|switch <name>|forget <name>|usage|refresh-identity>")
         }
     }
 
@@ -307,6 +311,154 @@ enum VaultCLI {
     }
 
     /// Proves the per-account usage endpoint end to end.
+    /// Asks the profile endpoint who each stored account is, and files the answer.
+    ///
+    /// Exists because accounts added before the sign-in flow made that call were
+    /// stored with no plan — the token response does not carry one. This is the
+    /// repair, and it costs one GET per account rather than four sign-ins.
+    ///
+    /// Read-only against the credential: it spends an access token to ask a
+    /// question and never touches the refresh token, so it cannot disturb the
+    /// rotation that invariant 5 exists to protect.
+    private static func refreshIdentity(_ vault: AccountVault) {
+        let accounts = vault.accounts()
+        guard !accounts.isEmpty else {
+            print("no accounts saved — `--vault login <name>` adds one")
+            return
+        }
+
+        // Resolved up front for the same reason `usage` does it: the detached
+        // task should capture plain strings, not the account structs. Stored
+        // rather than live, so filling in a plan label can never stall behind a
+        // Keychain dialog -- it did exactly that once.
+        let tokens: [(name: String, token: String?)] = accounts.map {
+            ($0.name, vault.storedAccessToken(for: $0))
+        }
+
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            for entry in tokens {
+                guard let token = entry.token else {
+                    print("  \(entry.name.padded(24)) no token")
+                    continue
+                }
+                guard let identity = await OAuthFlow.profile(accessToken: token) else {
+                    // Almost always an expired access token. Say so plainly
+                    // rather than implying the account is broken -- a swap
+                    // refreshes it and this command then works.
+                    print("  \(entry.name.padded(24)) no answer — token likely expired")
+                    continue
+                }
+                do {
+                    if try vault.updateIdentity(identity, for: entry.name) {
+                        print("  \(entry.name.padded(24)) \(identity.email.padded(26)) \(identity.planLabel)")
+                    } else {
+                        print("  \(entry.name.padded(24)) skipped — \(identity.email) is already filed under another name")
+                    }
+                } catch {
+                    print("  \(entry.name.padded(24)) could not write: \(error)")
+                }
+            }
+            done.signal()
+        }
+        done.wait()
+    }
+
+    /// What this week's subscription bought and what expires unbought.
+    ///
+    /// The number nobody reports. Claude Code shows what has been spent; the
+    /// weekly window refills on a schedule and does not roll over, so everything
+    /// left at the reset is money that bought nothing. Across several accounts
+    /// that is the whole argument for owning fewer of them, or working them
+    /// harder, and until now there was no way to see it.
+    private static func waste(_ vault: AccountVault) {
+        let accounts = vault.accounts()
+        guard !accounts.isEmpty else {
+            print("no accounts saved — `--vault login <name>` adds one")
+            return
+        }
+
+        // Same shape as `usage`: resolve to plain values before the detached
+        // task so the closure never captures an account struct.
+        let rows: [(name: String, plan: String, tier: String?, token: String?)] =
+            accounts.map { ($0.name, $0.plan ?? "—", $0.rateLimitTier, vault.storedAccessToken(for: $0)) }
+
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            print("UNUSED SUBSCRIPTION — current weekly window")
+            print("")
+            print("  \("account".padded(24))\("plan".padded(10))\("used".padded(8))\("expiring".padded(11))resets in")
+
+            let client = UsageClient()
+            var fleetExpiring = 0.0
+            var fleetPaid = 0.0
+            var unpriced: [String] = []
+            var tooEarly: [String] = []
+
+            for row in rows {
+                guard let token = row.token else {
+                    print("  \(row.name.padded(24))\(row.plan.padded(10))no token")
+                    continue
+                }
+                do {
+                    let snapshot = try await client.fetch(accessToken: token)
+                    guard let weekly = snapshot.weekly, let percent = weekly.reading.percent else {
+                        print("  \(row.name.padded(24))\(row.plan.padded(10))window has rolled over")
+                        continue
+                    }
+                    let resets = weekly.timeRemaining().map { Format.longCountdown($0) } ?? "—"
+
+                    guard let paid = PlanValue.weeklyPrice(forTier: row.tier) else {
+                        // No price for this tier: report the percentage honestly
+                        // rather than inventing a dollar figure for the total.
+                        unpriced.append(row.name)
+                        print("  \(row.name.padded(24))\(row.plan.padded(10))\("\(percent)%".padded(8))\("unpriced".padded(11))\(resets)")
+                        continue
+                    }
+
+                    // Projected at the current burn rate, not assumed-idle. A
+                    // window that just rolled over gets no figure at all rather
+                    // than being reported as a full week thrown away.
+                    guard let resetsAt = weekly.resetsAt,
+                          let expiring = PlanValue.projected(
+                            weeklyPercent: percent, resetsAt: resetsAt, tier: row.tier) else {
+                        tooEarly.append(row.name)
+                        print("  \(row.name.padded(24))\(row.plan.padded(10))\("\(percent)%".padded(8))\("too early".padded(11))\(resets)")
+                        continue
+                    }
+                    fleetExpiring += expiring
+                    fleetPaid += paid
+                    print("  \(row.name.padded(24))\(row.plan.padded(10))\("\(percent)%".padded(8))\(String(format: "$%.2f", expiring).padded(11))\(resets)")
+                } catch {
+                    print("  \(row.name.padded(24))\(row.plan.padded(10))\(error)")
+                }
+            }
+
+            print("")
+            if fleetPaid > 0 {
+                let share = 100 * fleetExpiring / fleetPaid
+                print("  \("paid this week".padded(24))\(String(format: "$%.2f", fleetPaid))")
+                print("  \("expiring unused".padded(24))\(String(format: "$%.2f", fleetExpiring))  (\(Int(share.rounded()))%)")
+                print("  \("annualised".padded(24))\(String(format: "$%.0f", fleetExpiring * 52)) / year")
+            } else {
+                print("  nothing priceable — run `--vault refresh-identity` to fill in plan tiers")
+            }
+            // Never let a silent omission flatter the total: both exclusions are
+            // named, so the fleet figure is always read against what it covers.
+            if !unpriced.isEmpty {
+                print("")
+                print("  excluded, no price for tier:  \(unpriced.joined(separator: ", "))")
+            }
+            if !tooEarly.isEmpty {
+                print("")
+                print("  excluded, window too young:   \(tooEarly.joined(separator: ", "))")
+                print("  projections need ~17h of a weekly window before they mean anything")
+            }
+            done.signal()
+        }
+        done.wait()
+    }
+
     private static func usage(_ vault: AccountVault) {
         let accounts = vault.accounts()
         guard !accounts.isEmpty else {

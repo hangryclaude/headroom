@@ -32,6 +32,15 @@ enum OAuthFlow {
     /// on every failure path; a paste is three seconds and has no failure modes.
     static let redirectURI = "https://platform.claude.com/oauth/code/callback"
 
+    /// Where the plan tier actually lives.
+    ///
+    /// The token response carries the organization's uuid and name but not its
+    /// type or rate limit tier, so a credential minted here has no plan until
+    /// something asks for it. Claude Code hits this endpoint during bootstrap and
+    /// writes the answer into `~/.claude.json`; doing it at sign-in means an
+    /// account shows its real plan straight away instead of after its first swap.
+    static let profileURL = URL(string: "https://api.anthropic.com/api/oauth/profile")!
+
     /// Exactly the set the live credential carries. Requesting fewer would mint a
     /// token that works for reading usage but quietly lacks the permissions
     /// Claude Code needs once the account is swapped in.
@@ -131,7 +140,7 @@ enum OAuthFlow {
         if let directory = diagnosticsDirectory {
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             TokenRefresher.writeDurably(
-                data, to: directory.appending(path: ".authorize-raw.json"))
+                shapeRecord(of: data), to: directory.appending(path: ".authorize-raw.json"))
         }
 
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -148,12 +157,95 @@ enum OAuthFlow {
             }
         }
 
-        return (blob(from: object, accessToken: accessToken), identity(from: object))
+        // Deliberately after the tokens are in hand, and deliberately unable to
+        // throw. The plan tier is worth a round trip but it is not worth losing a
+        // credential over: at this point the authorization code is already spent,
+        // so a thrown error here would strand a token that cannot be minted again
+        // without another sign-in.
+        let profile = await profile(accessToken: accessToken, session: session)
+
+        return (blob(from: object, accessToken: accessToken, profile: profile),
+                profile ?? identity(from: object))
+    }
+
+    /// Asks who this token belongs to and what they are paying for.
+    ///
+    /// Returns nil rather than throwing on every failure path — see the call site
+    /// in `exchange` for why. The account still saves; it just shows no plan until
+    /// something asks again.
+    static func profile(accessToken: String, session: URLSession = .shared) async -> Identity? {
+        var request = URLRequest(url: profileURL)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue(UsageClient.betaHeader, forHTTPHeaderField: "anthropic-beta")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Headroom/0.1 (macOS)", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, response) = try? await session.data(for: request),
+              (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0)
+        else { return nil }
+        return identity(fromProfile: data)
+    }
+
+    /// Identity from the profile endpoint, which unlike the token response
+    /// carries the organization's type and rate limit tier.
+    ///
+    /// Nil unless the account block is complete: a half-populated identity would
+    /// overwrite a good email with nothing on the backfill path.
+    static func identity(fromProfile data: Data) -> Identity? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let account = root["account"] as? [String: Any],
+              let email = account["email"] as? String ?? account["email_address"] as? String,
+              let uuid = account["uuid"] as? String
+        else { return nil }
+
+        let organization = root["organization"] as? [String: Any]
+        return Identity(
+            email: email,
+            accountUUID: uuid,
+            organizationUUID: organization?["uuid"] as? String,
+            organizationType: organization?["organization_type"] as? String,
+            rateLimitTier: organization?["rate_limit_tier"] as? String
+        )
+    }
+
+    /// The response keys and their types, with every value discarded.
+    ///
+    /// This file used to hold the raw token response so the shape could be read
+    /// off disk when a field moved. The shape is now known, and what was left was
+    /// a live refresh token sitting in Application Support indefinitely. Keeping
+    /// the keys keeps the diagnostic; dropping the values removes the liability.
+    static func shapeRecord(of data: Data) -> Data {
+        var lines: [String] = []
+        func walk(_ object: [String: Any], prefix: String) {
+            for key in object.keys.sorted() {
+                let value = object[key]
+                if let nested = value as? [String: Any] {
+                    walk(nested, prefix: prefix + key + ".")
+                } else {
+                    lines.append("\(prefix)\(key): \(type(of: value ?? "nil"))")
+                }
+            }
+        }
+        if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            walk(root, prefix: "")
+        } else {
+            lines.append("unparseable (\(data.count) bytes)")
+        }
+        let header = "# key shapes only — values are deliberately not recorded\n"
+        return Data((header + lines.joined(separator: "\n") + "\n").utf8)
     }
 
     /// Builds the credential in the exact shape Claude Code stores, so a swap
     /// writes something it can read back without translation.
-    private static func blob(from object: [String: Any], accessToken: String) -> Credentials {
+    ///
+    /// - Parameter profile: the plan tier, which the token response does not
+    ///   carry. Nil when the profile call failed, in which case the credential is
+    ///   still complete — it just has no plan on it.
+    static func blob(
+        from object: [String: Any], accessToken: String, profile: Identity?
+    ) -> Credentials {
         var oauth: [String: Any] = [
             "accessToken": accessToken,
             "clientId": clientID,
@@ -176,11 +268,15 @@ enum OAuthFlow {
         }
 
         let organization = object["organization"] as? [String: Any]
-        if let type = organization?["organization_type"] as? String {
+        // Profile first: the token response has never carried either of these in
+        // practice, but read it as a fallback so this keeps working if that
+        // changes rather than silently preferring a stale source.
+        if let type = profile?.organizationType
+            ?? organization?["organization_type"] as? String {
             oauth["subscriptionType"] = type
                 .replacingOccurrences(of: "claude_", with: "")
         }
-        if let tier = organization?["rate_limit_tier"] as? String {
+        if let tier = profile?.rateLimitTier ?? organization?["rate_limit_tier"] as? String {
             oauth["rateLimitTier"] = tier
         }
 
@@ -206,7 +302,10 @@ enum OAuthFlow {
 
     /// Identity straight out of the token response, so a newly added account
     /// carries a real email instead of the placeholder name it was typed under.
-    private static func identity(from object: [String: Any]) -> Identity? {
+    ///
+    /// Carries no plan — the token response has no tier in it. `identity(fromProfile:)`
+    /// is the one that does; this is the fallback when that call failed.
+    static func identity(from object: [String: Any]) -> Identity? {
         guard let account = object["account"] as? [String: Any],
               let email = account["email_address"] as? String ?? account["email"] as? String,
               let uuid = account["uuid"] as? String

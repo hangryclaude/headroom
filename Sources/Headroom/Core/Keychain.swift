@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 /// The half of an account swap that caam cannot do on this machine.
@@ -77,11 +78,20 @@ enum Keychain {
     /// Reads the secret. This is the call that prompts.
     static func read(
         service: String = ClaudePaths.keychainService,
-        account: String = defaultAccount
+        account: String = defaultAccount,
+        allowInteraction: Bool = true
     ) throws -> Data {
         var q = query(service: service, account: account)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
+        if !allowInteraction {
+            // Background work must never summon a password dialog over whatever
+            // the user is doing. If access is not already available, fail and
+            // let the automatic action defer until a manual switch authorises it.
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            q[kSecUseAuthenticationContext as String] = context
+        }
 
         var result: CFTypeRef?
         let status = SecItemCopyMatching(q as CFDictionary, &result)
@@ -103,9 +113,15 @@ enum Keychain {
     static func write(
         _ data: Data,
         service: String = ClaudePaths.keychainService,
-        account: String = defaultAccount
+        account: String = defaultAccount,
+        allowInteraction: Bool = true
     ) throws {
-        let q = query(service: service, account: account)
+        var q = query(service: service, account: account)
+        if !allowInteraction {
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            q[kSecUseAuthenticationContext as String] = context
+        }
         let attributes: [String: Any] = [kSecValueData as String: data]
 
         let status = SecItemUpdate(q as CFDictionary, attributes as CFDictionary)
