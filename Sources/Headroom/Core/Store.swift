@@ -229,7 +229,23 @@ final class Store {
             }
 
             do {
-                let snapshot = try await usageClient.fetch(accessToken: token)
+                let snapshot: QuotaSnapshot
+                do {
+                    snapshot = try await usageClient.fetch(accessToken: token)
+                } catch UsageClient.Failure.tokenExpired {
+                    // The server is authoritative. A token can be revoked before
+                    // its stored expiry, so force one rotation and retry instead
+                    // of leaving the row stuck at "token expired" until the
+                    // local timestamp catches up.
+                    guard let renewed = await usableToken(for: account, forceRefresh: true) else {
+                        usage[account.name] = AccountUsage(
+                            fetchedAt: Date(),
+                            error: refreshProblem[account.name] ?? "needs login"
+                        )
+                        continue
+                    }
+                    snapshot = try await usageClient.fetch(accessToken: renewed)
+                }
                 usage[account.name] = AccountUsage(
                     p5: snapshot.session?.reading.percent,
                     p7: snapshot.weekly?.reading.percent,
@@ -258,9 +274,9 @@ final class Store {
     /// Without this, a stored account goes dark after a few hours and its row
     /// reads "token expired" forever -- which defeats the whole point, since the
     /// account you most want to switch to is the one you have not been using.
-    private func usableToken(for account: StoredAccount) async -> String? {
+    private func usableToken(for account: StoredAccount, forceRefresh: Bool = false) async -> String? {
         guard let stored = vault.credentials(for: account) else { return nil }
-        if let expiresAt = stored.expiresAt,
+        if !forceRefresh, let expiresAt = stored.expiresAt,
            expiresAt.timeIntervalSinceNow > TokenRefresher.skew {
             refreshProblem[account.name] = nil
             return stored.accessToken
@@ -273,6 +289,7 @@ final class Store {
         switch await refresher.refreshIfNeeded(
             stored,
             directory: vault.directory(for: account),
+            force: forceRefresh,
             persist: { try vault.replaceCredentials($0, for: account) }
         ) {
         case .stillValid:
@@ -406,7 +423,9 @@ final class Store {
         lastAutoSwapAttempt = now
 
         let before = activeAccountName
-        switchTo(target)
+        // Auto mode runs in the background. It may use an existing Keychain
+        // grant, but it must never throw a password dialog over another app.
+        switchTo(target, allowKeychainPrompt: false)
         if lastSwapError == nil, activeAccountName != before {
             lastAutoSwap = (name: target, at: now)
         }
@@ -419,13 +438,16 @@ final class Store {
 
     // MARK: Actions
 
-    func switchTo(_ name: String, force: Bool = false) {
+    func switchTo(
+        _ name: String, force: Bool = false, allowKeychainPrompt: Bool = true
+    ) {
         guard !isRefreshingToken else {
             lastSwapError = "a token refresh is in flight — try again in a moment"
             return
         }
         do {
-            try vault.activate(name, force: force)
+            try vault.activate(
+                name, force: force, allowKeychainPrompt: allowKeychainPrompt)
             lastSwapError = nil
             refresh()
             Task { await refreshUsage(force: true) }

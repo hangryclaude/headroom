@@ -2,6 +2,20 @@ import AppKit
 import SwiftUI
 import UserNotifications
 
+/// `NSAlert` runs its own modal event loop, and this menu-bar app has no normal
+/// application menu. Handle paste at the field as well as through the Edit menu
+/// so Command-V cannot disappear depending on which responder AppKit chooses.
+private final class OAuthCodeField: NSTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers == .command, event.charactersIgnoringModifiers == "v" {
+            currentEditor()?.paste(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 /// AppKit rather than SwiftUI's `MenuBarExtra`.
 ///
 /// `MenuBarExtra` renders its label as a template, which flattens colour. The
@@ -29,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installEditMenu()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.target = self
@@ -53,6 +68,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.announceAutoSwapIfNeeded()
             }
         }
+    }
+
+    /// An accessory app has no menu bar of its own, so AppKit does not install
+    /// the standard responder-chain commands for text fields. Without these,
+    /// the OAuth code field accepts typing but Command-V is a silent no-op.
+    private func installEditMenu() {
+        let main = NSMenu()
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Edit")
+
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(NSMenuItem.separator())
+        edit.addItem(
+            withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        main.addItem(editItem)
+        main.setSubmenu(edit, for: editItem)
+        NSApp.mainMenu = main
     }
 
     // MARK: Status item
@@ -208,7 +243,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "Add a Claude account"
         alert.informativeText = """
-            Your browser will open so you can sign in. The account you are using now             stays signed in — nothing is swapped.
+            Your browser will open so you can sign in. The account you are using now \
+            stays signed in — nothing is swapped.
 
             Anthropic will show you a code. Paste it back here.
             """
@@ -238,13 +274,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "Paste the code"
         alert.informativeText = """
-            Sign in as the account you want to add, then paste the code Anthropic             shows you.
+            Sign in as the account you want to add, then paste the code Anthropic \
+            shows you.
             """
         alert.addButton(withTitle: "Add Account")
         alert.addButton(withTitle: "Cancel")
 
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        let field = OAuthCodeField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
         field.placeholderString = "paste the code here"
+        let fieldMenu = NSMenu()
+        fieldMenu.addItem(
+            withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "")
+        fieldMenu.addItem(NSMenuItem.separator())
+        fieldMenu.addItem(
+            withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "")
+        fieldMenu.addItem(
+            withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "")
+        field.menu = fieldMenu
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
 

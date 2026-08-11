@@ -24,6 +24,9 @@ enum SelfTest {
         configSurgery()
         lock()
         identity()
+        oauthProfile()
+        backfill()
+        planValue()
         rolledOverReadings()
         pricing()
 
@@ -414,6 +417,247 @@ enum SelfTest {
         let after = Credentials(raw: Data(#"{"accessToken":"t2","refreshToken":"r2"}"#.utf8))
         expect(before.fingerprint != after.fingerprint,
                "a rotated token changes the fingerprint (which is why it cannot identify an account)")
+    }
+
+    /// The plan tier on a newly signed-in account.
+    ///
+    /// Regression guard for a bug that shipped: `blob` read the tier out of the
+    /// token response, and the token response has never carried it. Every account
+    /// added through `OAuthFlow` was therefore stored with no plan, while the one
+    /// account captured from the Keychain had one — because Claude Code's own
+    /// bootstrap had already written the tier into `~/.claude.json`.
+    ///
+    /// The fixtures below are the real response shapes, keys and all, taken from
+    /// a live exchange and a live profile call rather than written from the docs.
+    private static func oauthProfile() {
+        section("OAuth profile")
+
+        // Exactly what the token endpoint returns. Note what is absent: no
+        // organization_type, no rate_limit_tier. That absence is the bug.
+        let tokenResponse = """
+        {"token_type":"Bearer","access_token":"at","expires_in":28800,
+         "refresh_token":"rt","scope":"user:profile user:inference",
+         "token_uuid":"tu","refresh_token_expires_in":31536000,
+         "organization":{"uuid":"org-uuid","name":"High Camp"},
+         "account":{"uuid":"acct-uuid","email_address":"a@b.com"}}
+        """
+        guard let token = try? JSONSerialization.jsonObject(
+            with: Data(tokenResponse.utf8)) as? [String: Any] else {
+            expect(false, "the token fixture parses"); return
+        }
+
+        expect(OAuthFlow.identity(from: token)?.planLabel == "—",
+               "the token response alone yields no plan — this is the whole bug")
+
+        let profileResponse = """
+        {"account":{"uuid":"acct-uuid","email":"a@b.com","full_name":"angus",
+                    "has_claude_max":false},
+         "organization":{"uuid":"org-uuid","name":"High Camp",
+                         "organization_type":"claude_team",
+                         "rate_limit_tier":"default_claude_max_5x",
+                         "seat_tier":"team_tier_1"},
+         "application":{"name":"Claude Code"}}
+        """
+        guard let profile = OAuthFlow.identity(fromProfile: Data(profileResponse.utf8)) else {
+            expect(false, "the profile response parses into an identity"); return
+        }
+        expect(profile.email == "a@b.com", "profile carries the email")
+        expect(profile.accountUUID == "acct-uuid", "profile carries the account UUID")
+        expect(profile.rateLimitTier == "default_claude_max_5x", "profile carries the tier")
+        expect(profile.planLabel == "Max 5x", "a team seat on Max 5x reads as 'Max 5x'")
+
+        // A profile that came back without an account is not an identity. Storing
+        // a half-populated one would overwrite a good email with nothing.
+        expect(OAuthFlow.identity(fromProfile: Data(#"{"organization":{"uuid":"o"}}"#.utf8)) == nil,
+               "a profile with no account yields nil rather than a partial identity")
+
+        // The fix: the tier reaches the stored credential, in Claude Code's own
+        // shape, so a swapped-in blob is indistinguishable from one it wrote.
+        let filled = OAuthFlow.blob(from: token, accessToken: "at", profile: profile)
+        guard let oauth = try? JSONSerialization.jsonObject(with: filled.raw) as? [String: Any],
+              let claude = oauth["claudeAiOauth"] as? [String: Any] else {
+            expect(false, "the credential blob is valid JSON"); return
+        }
+        expect(claude["rateLimitTier"] as? String == "default_claude_max_5x",
+               "the tier is written into the credential")
+        expect(claude["subscriptionType"] as? String == "team",
+               "organization_type is stored with the claude_ prefix stripped")
+        expect(claude["accessToken"] as? String == "at", "the token still lands")
+
+        // The profile call is best-effort: it happens after the tokens are minted,
+        // so a failure there must never lose them.
+        let bare = OAuthFlow.blob(from: token, accessToken: "at", profile: nil)
+        guard let bareOAuth = try? JSONSerialization.jsonObject(with: bare.raw) as? [String: Any],
+              let bareClaude = bareOAuth["claudeAiOauth"] as? [String: Any] else {
+            expect(false, "the blob is still valid with no profile"); return
+        }
+        expect(bareClaude["accessToken"] as? String == "at",
+               "a failed profile lookup still stores the tokens")
+        expect(bareClaude["refreshToken"] as? String == "rt",
+               "and still stores the refresh token")
+
+        // The diagnostic that used to be a live token set on disk.
+        let record = OAuthFlow.shapeRecord(of: Data(tokenResponse.utf8))
+        let text = String(decoding: record, as: UTF8.self)
+        expect(text.contains("access_token"), "the shape record keeps the key names")
+        expect(!text.contains("\"at\""), "the shape record does not keep the access token")
+        expect(!text.contains("\"rt\""), "the shape record does not keep the refresh token")
+        expect(text.contains("organization.name"), "nested keys are flattened, not dropped")
+    }
+
+    /// Filling in the plan on accounts that were added before the profile call
+    /// existed, without a re-login.
+    ///
+    /// The guard being tested is the same one `capture` and `adopt` enforce:
+    /// account identity is the UUID, so backfilling one onto a slot that would
+    /// collide with another slot has to refuse rather than write. Two entries
+    /// sharing a UUID is the shape that made the live account unrecognisable and
+    /// got its consumed refresh token replayed.
+    private static func backfill() {
+        section("Identity backfill")
+
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "headroom-backfill-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let vault = AccountVault(root: root)
+
+        let credentials = Credentials(raw: Data(#"{"accessToken":"a","refreshToken":"r"}"#.utf8))
+        let other = Credentials(raw: Data(#"{"accessToken":"b","refreshToken":"s"}"#.utf8))
+        guard (try? vault.adopt(credentials, identity: nil, as: "one")) != nil,
+              (try? vault.adopt(other, identity: nil, as: "two")) != nil else {
+            expect(false, "two accounts adopt into a fresh vault"); return
+        }
+        expect(vault.accounts().first(where: { $0.name == "one" })?.plan == nil,
+               "an account adopted without an identity starts with no plan")
+
+        let identity = Identity(
+            email: "a@b.com", accountUUID: "uuid-one", organizationUUID: "org",
+            organizationType: "claude_max", rateLimitTier: "default_claude_max_20x")
+        expect((try? vault.updateIdentity(identity, for: "one")) == true,
+               "backfilling an account with a free UUID succeeds")
+
+        let filled = vault.accounts().first { $0.name == "one" }
+        expect(filled?.email == "a@b.com", "the email lands")
+        expect(filled?.plan == "Max 20x", "the plan lands, humanised")
+        expect(filled?.accountUUID == "uuid-one", "the UUID lands")
+        expect(filled?.rateLimitTier == "default_claude_max_20x",
+               "the raw tier lands alongside the label, so pricing has a stable key")
+        expect(filled?.fingerprint == credentials.fingerprint,
+               "backfill does not disturb the credential fingerprint")
+
+        // The same identity against a second slot is the collision case.
+        expect((try? vault.updateIdentity(identity, for: "two")) == false,
+               "backfilling a UUID another account already holds is refused")
+        expect(vault.accounts().first(where: { $0.name == "two" })?.email == nil,
+               "the refused account is left untouched rather than half-written")
+        expect(vault.accounts().first(where: { $0.name == "one" })?.email == "a@b.com",
+               "and the account that legitimately holds the UUID keeps it")
+
+        // Re-running the backfill over an account that already has the identity
+        // is the normal case on a second run, and must not trip its own guard.
+        expect((try? vault.updateIdentity(identity, for: "one")) == true,
+               "re-backfilling the same account with the same UUID is idempotent")
+    }
+
+    /// What a week of unused subscription is worth.
+    ///
+    /// Deliberately denominated in dollars-of-subscription rather than tokens.
+    /// Converting an unused percentage into a token count needs a
+    /// tokens-per-percent anchor that varies by model mix and cache ratio, so any
+    /// figure would be an estimate dressed as a measurement. The subscription
+    /// price is exact, and a percentage of it is still exact.
+    private static func planValue() {
+        section("Unused subscription")
+
+        expect(PlanValue.monthlyPrice(forTier: "default_claude_max_20x") == 200,
+               "Max 20x is $200/month")
+        expect(PlanValue.monthlyPrice(forTier: "default_claude_max_5x") == 100,
+               "Max 5x is $100/month")
+        expect(PlanValue.monthlyPrice(forTier: "default_claude_pro") == 20,
+               "Pro is $20/month")
+        expect(PlanValue.monthlyPrice(forTier: nil) == nil,
+               "an unknown tier prices as nil rather than guessing")
+        expect(PlanValue.monthlyPrice(forTier: "default_claude_tangelo_9x") == nil,
+               "an unrecognised tier prices as nil rather than guessing")
+
+        // 12 monthly payments buy 52 weekly windows, not 48 -- the naive
+        // month/4 conversion overstates every weekly figure by ~8%.
+        guard let weekly = PlanValue.weeklyPrice(forTier: "default_claude_max_20x") else {
+            expect(false, "Max 20x has a weekly price"); return
+        }
+        expect(abs(weekly - (200 * 12 / 52)) < 0.01,
+               "a weekly window costs monthly x 12 / 52, not monthly / 4")
+
+        guard let spent = PlanValue.expired(weeklyPercent: 96, tier: "default_claude_max_20x"),
+              let idle = PlanValue.expired(weeklyPercent: 4, tier: "default_claude_max_20x")
+        else { expect(false, "expired() prices a known tier"); return }
+        expect(abs(spent - weekly * 0.04) < 0.01,
+               "96% used leaves 4% of the week's price expiring")
+        expect(abs(idle - weekly * 0.96) < 0.01,
+               "4% used leaves 96% of it expiring")
+        expect(idle > spent, "the barely-touched account wastes more than the hammered one")
+
+        // A window nobody touched wastes the whole thing, and one run to the wall
+        // wastes nothing. Both ends have to be exact or the headline is wrong.
+        expect(PlanValue.expired(weeklyPercent: 0, tier: "default_claude_max_5x")
+               == PlanValue.weeklyPrice(forTier: "default_claude_max_5x"),
+               "an untouched week wastes its entire price")
+        expect(PlanValue.expired(weeklyPercent: 100, tier: "default_claude_max_5x") == 0,
+               "a fully-used week wastes nothing")
+
+        // The server has been seen reporting over 100 on a rolled-over window.
+        // Left unclamped that yields negative waste, which would quietly subtract
+        // from the fleet total and understate the headline.
+        expect(PlanValue.expired(weeklyPercent: 118, tier: "default_claude_max_20x") == 0,
+               "a percentage above 100 clamps to zero waste, never negative")
+        expect(PlanValue.expired(weeklyPercent: -5, tier: "default_claude_max_20x") == weekly,
+               "a negative percentage clamps to a fully wasted week")
+        expect(PlanValue.expired(weeklyPercent: 50, tier: "who-knows") == nil,
+               "an unknown tier yields no waste figure rather than a made-up one")
+
+        // `expired` assumes nothing more gets used, which is only honest at the
+        // very end of a window. Mid-window it reports a freshly-reset account as
+        // wasting its entire price, which is the difference between a
+        // measurement and a scare number. Project at pace instead.
+        let now = Date()
+        func resets(elapsed: Double) -> Date {
+            now.addingTimeInterval(Forecaster.weekLength * (1 - elapsed))
+        }
+        let tier = "default_claude_max_20x"
+
+        expect(PlanValue.projected(weeklyPercent: 50, resetsAt: resets(elapsed: 0.5),
+                                   tier: tier, now: now) == 0,
+               "spending exactly on pace projects no waste")
+
+        if let idle = PlanValue.projected(weeklyPercent: 0, resetsAt: resets(elapsed: 0.5),
+                                          tier: tier, now: now) {
+            expect(abs(idle - weekly) < 0.01,
+                   "half the window gone with nothing spent projects the whole price wasted")
+        } else {
+            expect(false, "an untouched half-elapsed window projects a figure")
+        }
+
+        if let half = PlanValue.projected(weeklyPercent: 25, resetsAt: resets(elapsed: 0.5),
+                                          tier: tier, now: now) {
+            expect(abs(half - weekly * 0.5) < 0.01,
+                   "25% spent at the halfway mark projects half the price wasted")
+        } else {
+            expect(false, "a half-paced window projects a figure")
+        }
+
+        expect(PlanValue.projected(weeklyPercent: 90, resetsAt: resets(elapsed: 0.5),
+                                   tier: tier, now: now) == 0,
+               "burning faster than pace projects no waste, never negative")
+
+        // The case that made this necessary: a window that has just rolled over.
+        // Any projection from a few minutes of data is noise, so it declines to
+        // give one rather than reporting a full week wasted.
+        expect(PlanValue.projected(weeklyPercent: 0, resetsAt: resets(elapsed: 0.02),
+                                   tier: tier, now: now) == nil,
+               "a barely-started window declines to project rather than crying waste")
+        expect(PlanValue.projected(weeklyPercent: 50, resetsAt: resets(elapsed: 0.5),
+                                   tier: "who-knows", now: now) == nil,
+               "an unknown tier still projects nothing")
     }
 
     /// Cost maths. Wrong numbers here are silently wrong — nothing else in the

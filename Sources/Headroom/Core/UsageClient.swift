@@ -58,8 +58,8 @@ struct UsageClient {
 
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         // 401/403 mean this account's token needs refreshing, which is a
-        // different problem from the endpoint being down -- the UI should offer
-        // a re-login rather than a retry.
+        // different problem from the endpoint being down. Store forces one
+        // refresh and retries before it considers the account unavailable.
         if status == 401 || status == 403 { throw Failure.tokenExpired }
         guard (200..<300).contains(status) else { throw Failure.http(status) }
 
