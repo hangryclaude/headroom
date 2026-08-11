@@ -209,12 +209,27 @@ Headroom --vault import     <name> <file> a credential exported from another Mac
 Headroom --vault save       <name>        store the current login (prompts once)
 Headroom --vault switch     <name>
 Headroom --vault usage                    live per-account quota
+Headroom --devin status                   key + org + allowance (never prompts)
+Headroom --devin set                      reads the key from stdin, never from argv
+Headroom --devin org <org-…>
+Headroom --devin allowance <acus>         the denominator the API does not report
+Headroom --devin list                     live session list, and the check that it works
 Headroom --render <dir>                   every surface to PNG, light and dark
 Headroom --selftest
 ```
 
 `--vault status` is deliberately prompt-free; `save` is where the Keychain dialog belongs,
 because a prompt appearing out of nowhere under a dropdown is a bad first experience.
+
+`--devin set` takes the key on stdin (`pbpaste | Headroom --devin set`) rather than as an
+argument, because argv is readable by every process on the machine and lands in shell
+history besides. The Devin section only appears once both a key and an org id exist, and
+the first fetch happens when the dropdown opens — not at launch — for the same
+prompt-where-expected reason.
+
+Devin publishes no consumption endpoint on a self-serve plan, so ACUs are summed from
+`acus_consumed` on the session list, which is exact. The plan's *allowance* has no endpoint
+at all; that is why it is config, and why there is no gauge until you set one.
 
 ---
 

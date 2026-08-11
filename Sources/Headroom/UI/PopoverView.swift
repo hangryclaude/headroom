@@ -26,6 +26,19 @@ struct PopoverView: View {
             }
             rule
             accounts
+            // Absent, not empty, when Devin is not set up: `devinSummary` is nil
+            // until a key and org id both exist.
+            if let summary = store.devinSummary {
+                rule
+                DevinSection(
+                    summary: summary,
+                    sessions: store.devinSessions ?? [],
+                    error: store.devinError,
+                    allowance: DevinCredentials.allowance,
+                    hasLoaded: store.devinHasLoaded,
+                    onOpen: { NSWorkspace.shared.open($0) }
+                )
+            }
             rule
             footer
         }

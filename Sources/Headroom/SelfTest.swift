@@ -29,6 +29,7 @@ enum SelfTest {
         planValue()
         rolledOverReadings()
         pricing()
+        devin()
 
         print("")
         print(failures == 0
@@ -730,6 +731,120 @@ enum SelfTest {
         let brokenDecision = Policy.decide(current: broken, accounts: [broken])
         expect(brokenDecision.verdict == .allHot,
                "an account with genuinely no data still reports ALL-HOT")
+    }
+
+    private static func devin() {
+        section("Devin")
+
+        // Shape taken from the v3 list-sessions schema, not invented: the fields
+        // asserted here are the ones the endpoint documents as required.
+        let listJSON = """
+        {"items":[
+          {"session_id":"s-1","url":"https://app.devin.ai/sessions/s-1",
+           "org_id":"org-x","status":"running","status_detail":"working",
+           "title":"fix auth flow","acus_consumed":12.5,
+           "created_at":1754870000,"updated_at":1754880000,
+           "tags":[],"pull_requests":[]},
+          {"session_id":"s-2","url":"https://app.devin.ai/sessions/s-2",
+           "org_id":"org-x","status":"suspended","status_detail":"waiting_for_user",
+           "title":"port kernel","acus_consumed":3,
+           "created_at":1754860000,"updated_at":1754861000,
+           "tags":[],"pull_requests":[]},
+          {"session_id":"s-3","url":"https://app.devin.ai/sessions/s-3",
+           "org_id":"org-x","status":"exit","status_detail":"finished",
+           "acus_consumed":4.25,
+           "created_at":1754850000,"updated_at":1754851000,
+           "tags":[],"pull_requests":[],"is_archived":true}
+        ],"end_cursor":null,"has_next_page":false,"total":3}
+        """
+
+        let sessions = (try? DevinClient.parse(Data(listJSON.utf8))) ?? []
+        expect(sessions.count == 3, "parses every item in the list envelope")
+
+        guard let first = sessions.first else {
+            expect(false, "list must yield a first session")
+            return
+        }
+        expect(first.id == "s-1", "reads session_id")
+        expect(first.title == "fix auth flow", "reads title")
+        expect(first.status == .running, "maps status 'running'")
+        expect(first.statusDetail == "working", "keeps status_detail for the row")
+        expect(abs(first.acusConsumed - 12.5) < 0.001, "reads fractional acus_consumed")
+        expect(first.url?.host == "app.devin.ai", "reads url")
+
+        // Title is optional in the schema, so the row has to have a fallback that
+        // is not an empty string -- a blank row reads as a broken fetch.
+        expect(sessions[2].title == nil, "tolerates a session with no title")
+        expect(!sessions[2].displayTitle.isEmpty, "an untitled session still has a label")
+        expect(sessions[2].isArchived, "reads is_archived")
+        expect(!first.isArchived, "is_archived defaults to false when absent")
+
+        // Every documented status must map. An unrecognised one must not throw
+        // the whole list away -- one new status value upstream would otherwise
+        // blank the entire section.
+        for raw in ["new", "claimed", "running", "exit", "error", "suspended", "resuming"] {
+            expect(DevinSession.Status(api: raw) != .unknown, "maps documented status '\(raw)'")
+        }
+        expect(DevinSession.Status(api: "teleporting") == .unknown, "an unknown status degrades")
+
+        expect(DevinSession.Status.running.isActive, "running counts as active")
+        expect(DevinSession.Status.resuming.isActive, "resuming counts as active")
+        expect(DevinSession.Status.claimed.isActive, "claimed counts as active")
+        expect(!DevinSession.Status.suspended.isActive, "suspended is not active")
+        expect(!DevinSession.Status.exit.isActive, "exit is not active")
+
+        // The schema says integer timestamps but does not say which unit, and the
+        // same ambiguity already bit the credential parser. Both must land in 2025+.
+        let asSeconds = DevinClient.date(from: 1754870000)
+        let asMillis = DevinClient.date(from: 1754870000000)
+        expect(abs(asSeconds.timeIntervalSince(asMillis)) < 1,
+               "millisecond and second timestamps resolve to the same instant")
+
+        // MARK: Summary
+
+        let now = Date(timeIntervalSince1970: 1754890000)
+        let summary = DevinUsage.summarise(sessions, allowance: nil, now: now)
+        expect(summary.active == 1, "counts one active session")
+        expect(summary.asleep == 1, "counts one suspended session")
+        expect(abs(summary.acus - 19.75) < 0.001, "sums acus across all sessions")
+        expect(summary.percent == nil, "no allowance configured means no percentage")
+
+        let gauged = DevinUsage.summarise(sessions, allowance: 100, now: now)
+        expect(gauged.percent.map { abs($0 - 19.75) < 0.001 } == true,
+               "an allowance turns consumption into a percentage")
+
+        // Over-spend must report honestly rather than pin at 100: the whole point
+        // of the gauge is to show that a limit was blown through.
+        let over = DevinUsage.summarise(sessions, allowance: 10, now: now)
+        expect((over.percent ?? 0) > 100, "spending past the allowance reports over 100%")
+
+        // Sessions outside the period must not be counted, or the number only
+        // ever grows and stops meaning anything.
+        let periodStart = Date(timeIntervalSince1970: 1754865000)
+        let scoped = DevinUsage.summarise(sessions, allowance: nil, now: now, since: periodStart)
+        expect(abs(scoped.acus - 12.5) < 0.001, "only sessions inside the period are summed")
+
+        // The invariant borrowed from the quota gauge: nothing-configured and
+        // nothing-happened must not render identically, because a zeroed gauge
+        // reads as "plenty left".
+        let empty = DevinUsage.summarise([], allowance: nil, now: now)
+        expect(empty.acus == 0 && empty.active == 0, "an empty org summarises to zeroes")
+        expect(empty.isEmpty, "an empty org is distinguishable from an unconfigured one")
+
+        // MARK: Client failures
+
+        expect(DevinClient.Failure.unauthorized.short == "key rejected",
+               "a 403 says the key was rejected, not that usage is zero")
+        expect(DevinClient.Failure.noOrg.short.contains("org"),
+               "a missing org id names the org id")
+        expect((try? DevinClient.parse(Data("not json".utf8))) == nil,
+               "unreadable JSON throws rather than yielding an empty list")
+
+        // An empty envelope is a real answer and must parse, not throw -- that is
+        // exactly what this org returns today.
+        let emptyEnvelope = #"{"items":[],"end_cursor":null,"has_next_page":false,"total":0}"#
+        expect((try? DevinClient.parse(Data(emptyEnvelope.utf8)))?.isEmpty == true,
+               "an empty org parses to an empty list, not an error")
     }
 
     // MARK: Harness

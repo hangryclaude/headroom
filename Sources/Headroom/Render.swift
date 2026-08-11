@@ -16,6 +16,10 @@ enum Render {
 
         let store = Store()
         settle(store)
+        // No-op unless HEADROOM_DEVIN_FIXTURE is set. The live Devin fetch is
+        // deliberately not on this path: it reads the Keychain, and the prompt
+        // that causes hung a headless render indefinitely.
+        store.loadDevinFixture()
         let view = PopoverView(store: store, onQuit: {}, onRefresh: {}, onAddAccount: {}, onOpenPanel: {})
 
         for (name, appearance) in [("dark", NSAppearance.Name.darkAqua),
