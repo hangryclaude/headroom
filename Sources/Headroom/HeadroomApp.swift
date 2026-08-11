@@ -19,6 +19,11 @@ struct Headroom {
             return
         }
 
+        if let i = CommandLine.arguments.firstIndex(of: "--devin") {
+            DevinCLI.run(Array(CommandLine.arguments.dropFirst(i + 1)))
+            return
+        }
+
         if let i = CommandLine.arguments.firstIndex(of: "--icon"),
            let directory = CommandLine.arguments[safe: i + 1] {
             MainActor.assumeIsolated { IconRenderer.run(directory: directory) }

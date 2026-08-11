@@ -349,6 +349,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// action, so the right-click settings path would stop firing.
     private func showDropdown() {
         store.refresh()
+        // First read of the Devin key prompts; opening the dropdown is the
+        // moment the user is asking for this data, so it is where the prompt
+        // belongs. TTL-gated, so this is one request every five minutes at most.
+        Task { await store.refreshDevin() }
 
         let menu = NSMenu()
         menu.delegate = self

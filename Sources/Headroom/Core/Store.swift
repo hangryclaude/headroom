@@ -79,6 +79,14 @@ final class Store {
     private(set) var tokensByModel24h: [String: TokenUsage] = [:]
     private(set) var burnPerMinute: Double = 0
     private(set) var lastSwapError: String?
+
+    /// Devin sessions for the configured org, and why the last fetch failed.
+    ///
+    /// Both nil-when-unconfigured: the section is absent rather than empty,
+    /// because a zeroed Devin row would read the same as a healthy quiet one.
+    private(set) var devinSessions: [DevinSession]?
+    private(set) var devinError: String?
+    private(set) var devinFetchedAt: Date?
     /// What auto mode last did, so the popover can say so rather than the
     /// account silently changing under the user.
     private(set) var lastAutoSwap: (name: String, at: Date)?
@@ -91,6 +99,8 @@ final class Store {
     private let indexer = TranscriptIndexer()
     let vault = AccountVault()
     private let usageClient = UsageClient()
+    private let devinClient = DevinClient()
+    private var isFetchingDevin = false
     private let refresher = TokenRefresher()
     /// Why an account's token could not be renewed, so the row can say something
     /// truer than "expired".
@@ -119,6 +129,10 @@ final class Store {
     /// do not move fast enough to justify hammering it.
     private static let usageTTL: TimeInterval = 12 * 60
 
+    /// Longer than the quota TTL. A session that changed state ten minutes ago is
+    /// still news; a quota that did could already have cost him a swap.
+    private static let devinTTL: TimeInterval = 5 * 60
+
     init() {
         settings = .current
         refresh()
@@ -130,6 +144,13 @@ final class Store {
             Task { @MainActor in self?.onTick() }
         }
         Task { await refreshUsage() }
+        // Deliberately NOT fetched here. Reading the Devin key out of the
+        // Keychain triggers a "wants to use your confidential information"
+        // dialog the first time each signed binary asks, and firing that at
+        // launch is the surprise `VaultCLI` already refuses to cause. The
+        // popover-open path asks instead, where a prompt is expected — and it
+        // is why a headless `--render` can no longer hang on a dialog nobody
+        // is there to answer.
         refreshTokens()
     }
 
@@ -141,7 +162,81 @@ final class Store {
         if tick % 5 == 0 { refresh(); evaluateAutoSwap() }
         if tick % 30 == 0 { refreshTokens() }
         if tick % 60 == 0 { Task { await refreshUsage() } }
+        // Slower than the quota poll: sessions change on human timescales, and
+        // this endpoint is not the one keeping the user out of trouble.
+        if tick % 120 == 0 { Task { await refreshDevin() } }
     }
+
+    /// Devin's session list. Skipped entirely when unconfigured, so an install
+    /// that never touches Devin makes no requests and shows no section.
+    func refreshDevin(force: Bool = false) async {
+        if loadDevinFixture() { return }
+
+        guard DevinCredentials.isConfigured else {
+            devinSessions = nil
+            devinError = nil
+            return
+        }
+        guard !isFetchingDevin else { return }
+        if !force, let fetchedAt = devinFetchedAt,
+           Date().timeIntervalSince(fetchedAt) < Self.devinTTL { return }
+
+        isFetchingDevin = true
+        defer { isFetchingDevin = false }
+
+        guard let orgID = DevinCredentials.orgID,
+              let key = try? DevinCredentials.readKey() else {
+            // hasKey said yes but the read failed, which on this path means the
+            // user denied the Keychain prompt. Say that rather than showing zero.
+            devinError = "Keychain access denied"
+            return
+        }
+
+        do {
+            devinSessions = try await devinClient.fetchSessions(orgID: orgID, apiKey: key)
+            devinError = nil
+            devinFetchedAt = Date()
+        } catch let failure as DevinClient.Failure {
+            devinError = failure.short
+        } catch {
+            devinError = error.localizedDescription
+        }
+    }
+
+    /// Same escape hatch as HEADROOM_HOME: `--render` has to be able to
+    /// photograph a populated section, and a real org that has run nothing
+    /// cannot supply one. Reads a saved list response off disk.
+    ///
+    /// Synchronous and separate from `refreshDevin` because the render harness
+    /// needs it without going near the Keychain — the async path prompts, and a
+    /// headless render has nobody to answer the dialog.
+    ///
+    /// - Returns: whether a fixture was loaded.
+    @discardableResult
+    func loadDevinFixture() -> Bool {
+        guard let path = ProcessInfo.processInfo.environment["HEADROOM_DEVIN_FIXTURE"],
+              let data = FileManager.default.contents(atPath: path) else { return false }
+        devinSessions = (try? DevinClient.parse(data)) ?? []
+        devinError = nil
+        devinFetchedAt = Date()
+        return true
+    }
+
+    /// nil only when Devin is unconfigured.
+    ///
+    /// Deliberately *not* keyed off `devinSessions` being non-nil: a failed fetch
+    /// leaves that nil, which would hide the whole section and take the error
+    /// message with it — the section would silently vanish exactly when it had
+    /// something to say. Configured means shown; the view decides what to print.
+    var devinSummary: DevinUsage.Summary? {
+        guard DevinCredentials.isConfigured else { return nil }
+        return DevinUsage.summarise(
+            devinSessions ?? [], allowance: DevinCredentials.allowance, now: now)
+    }
+
+    /// False until the first fetch settles, so the section can say "checking"
+    /// rather than "no sessions yet" — which would be a claim, not a status.
+    var devinHasLoaded: Bool { devinFetchedAt != nil || devinError != nil }
 
     // MARK: Local reads
 
