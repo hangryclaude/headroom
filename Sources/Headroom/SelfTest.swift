@@ -403,7 +403,7 @@ enum SelfTest {
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let uuid = "74e540af-77c4-4bf1-abde-9ac3f28d93cd"
+        let uuid = "0f3a9c1e-2b4d-4e6f-8a1b-3c5d7e9f1a2b"
         let json = """
         {"oauthAccount":{"emailAddress":"a@b.com","accountUuid":"\(uuid)",
          "organizationRateLimitTier":"default_claude_max_20x"}}
