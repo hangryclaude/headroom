@@ -287,6 +287,15 @@ struct TokenRefresher {
         return write(descriptor, &bytes, bytes.count) == bytes.count
     }
 
+    /// Whether the lock is still ours. A holder that may have outlived
+    /// `lockTimeout` -- a swap parked on a Keychain dialog, say -- checks this
+    /// before any write the lock was meant to protect, because a competitor is
+    /// entitled to break a lock that old and claim it.
+    static func holdsLock(_ url: URL, ownership: String) -> Bool {
+        let current = (try? Data(contentsOf: url)).map { String(decoding: $0, as: UTF8.self) }
+        return current == ownership
+    }
+
     static func releaseLock(_ url: URL, ownership: String) {
         let current = (try? Data(contentsOf: url)).map { String(decoding: $0, as: UTF8.self) }
         // Somebody else's lock now. Leaving it alone is the safe failure.

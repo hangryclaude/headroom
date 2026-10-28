@@ -629,6 +629,9 @@ enum SelfTest {
         var modified: Date?
         var readError: Error?
         var writeError: Error?
+        /// Runs inside `read`, standing in for whatever happens while a real
+        /// read sits on a password dialog.
+        var duringRead: (() -> Void)?
         private(set) var writes = 0
 
         init(_ data: Data?) {
@@ -641,6 +644,7 @@ enum SelfTest {
 
         func read(allowInteraction: Bool) throws -> Data {
             if let readError { throw readError }
+            duringRead?()
             guard let data else { throw Keychain.Failure.notFound }
             return data
         }
@@ -828,6 +832,37 @@ enum SelfTest {
         expect(!FileManager.default.fileExists(atPath: targetLock.path)
                && !FileManager.default.fileExists(atPath: outgoingLock.path),
                "the swap releases both refresh locks when it is done")
+
+        // 8. The lock is breakable after `lockTimeout`, and a swap parked on a
+        //    Keychain dialog can outlive that. A competitor that broke and
+        //    re-took the lock during the wait must make the swap refuse, with
+        //    nothing installed, rather than race the new holder.
+        guard let f8 = makeFixture() else { expect(false, "a sixth fixture builds"); return }
+        defer { try? FileManager.default.removeItem(at: f8.root) }
+        let before8 = f8.store.data
+        let stolen = f8.vault.refreshLock(for: "b")
+        f8.store.duringRead = {
+            try? FileManager.default.removeItem(at: stolen)
+            _ = TokenRefresher.acquireLock(stolen)
+        }
+        if case .some = try? f8.vault.activate("b") {
+            expect(false, "a swap whose lock was stolen during the Keychain wait is refused")
+        } else {
+            expect(true, "a swap whose lock was stolen during the Keychain wait is refused")
+        }
+        expect(f8.store.data == before8, "the refused swap installed nothing after the theft")
+        expect(FileManager.default.fileExists(atPath: stolen.path),
+               "the refused swap leaves the thief's lock alone")
+
+        // 9. A listed account whose directory is gone is a stale index, and is
+        //    reported as such rather than as a refresh in flight.
+        guard let f9 = makeFixture() else { expect(false, "a seventh fixture builds"); return }
+        defer { try? FileManager.default.removeItem(at: f9.root) }
+        try? FileManager.default.removeItem(at: f9.root.appending(path: "b"))
+        var message9 = ""
+        do { _ = try f9.vault.activate("b") } catch { message9 = String(describing: error) }
+        expect(!message9.isEmpty && !message9.contains("in flight"),
+               "a missing vault directory is refused as missing credentials, never as a refresh in flight")
     }
 
     private static func backfill() {

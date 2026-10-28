@@ -220,7 +220,9 @@ enum Keychain {
     ///
     /// A status read, never a prompt. Treats an error as "locked", because the
     /// only caller uses the answer to decide whether a prompt is impossible,
-    /// and "unknown" is not the same as "impossible".
+    /// and "unknown" is not the same as "impossible". Asks about the default
+    /// keychain only, which is where Claude Code's item lives; an item in some
+    /// other keychain would merely be read the conservative way.
     @available(macOS, deprecated: 10.10)
     static func defaultKeychainIsUnlocked() -> Bool {
         var status = SecKeychainStatus()

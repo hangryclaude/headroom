@@ -33,6 +33,7 @@ enum VaultError: Error, CustomStringConvertible {
     case cannotReadOutgoing(String)
     case duplicateAccount(existing: String, email: String)
     case refreshInFlight(String)
+    case lockLost(String)
 
     var description: String {
         switch self {
@@ -50,6 +51,9 @@ enum VaultError: Error, CustomStringConvertible {
             return "refusing to swap — cannot read the current account (\(why))"
         case .refreshInFlight(let n):
             return "a token refresh for \(n) is in flight — try again in a moment"
+        case .lockLost(let n):
+            return "refusing to finish the swap — \(n)'s token was touched by another "
+                 + "process while a Keychain dialog was waiting; try again"
         }
     }
 }
@@ -530,14 +534,35 @@ final class AccountVault: @unchecked Sendable {
         // consumed -- which revokes the account rather than logging it out.
         // The lock is a file, so this also covers the CLI swapping while the
         // menu bar app is refreshing, which no in-process flag can see.
+        // Listed but with no directory means a stale index, not a busy lock:
+        // the lock file cannot be created inside a directory that is not there,
+        // and reporting that as "refresh in flight" would send the user chasing
+        // a refresh that does not exist.
+        guard FileManager.default.fileExists(atPath: root.appending(path: name).path),
+              let target = storedCredentials(name), target.accessToken != nil
+        else { throw VaultError.noCredentials }
+
         let targetLock = refreshLock(for: name)
         guard let targetOwnership = TokenRefresher.acquireLock(targetLock) else {
             throw VaultError.refreshInFlight(name)
         }
         defer { TokenRefresher.releaseLock(targetLock, ownership: targetOwnership) }
 
-        guard let target = storedCredentials(name), target.accessToken != nil else {
-            throw VaultError.noCredentials
+        // The lock can be broken by a competitor once it is older than
+        // `TokenRefresher.lockTimeout`, and a swap is the one holder that can
+        // legitimately outlive that: both Keychain calls below may sit on a
+        // password dialog for as long as the person takes. So the lock is
+        // re-checked after each wait, and a stolen lock refuses the swap
+        // before anything is written rather than racing the new holder.
+        var outgoingLock: (url: URL, ownership: String)?
+        func stillExclusive() throws {
+            guard TokenRefresher.holdsLock(targetLock, ownership: targetOwnership) else {
+                throw VaultError.lockLost(name)
+            }
+            if let outgoingLock,
+               !TokenRefresher.holdsLock(outgoingLock.url, ownership: outgoingLock.ownership) {
+                throw VaultError.lockLost(outgoingLock.url.deletingLastPathComponent().lastPathComponent)
+            }
         }
 
         // The identity cache can outlive the Keychain item. This happens after a
@@ -564,7 +589,6 @@ final class AccountVault: @unchecked Sendable {
         // that started a moment earlier. Resolved here, ahead of the read, for
         // that reason; the name is a pure function of the vault files.
         let currentName = resolvedActiveName(among: list)
-        var outgoingLock: (url: URL, ownership: String)?
         if let currentName, currentName != name,
            list.contains(where: { $0.name == currentName }) {
             let url = refreshLock(for: currentName)
@@ -594,6 +618,8 @@ final class AccountVault: @unchecked Sendable {
         } catch {
             throw VaultError.cannotReadOutgoing(String(describing: error))
         }
+        // The read above is the first place a dialog can wait on a person.
+        try stillExclusive()
 
         try backupEverything(live)
 
@@ -648,6 +674,11 @@ final class AccountVault: @unchecked Sendable {
         // repopulates correctly on its next launch.
         try Self.repointConfig(at: identityURL)
 
+        // The write is the second place a dialog can wait, and the one that
+        // installs the token, so this is the last moment a stolen lock can
+        // still be refused cheaply: a cleared identity cache in front of an
+        // unchanged token is the failure mode Claude Code repairs on launch.
+        try stillExclusive()
         try store.write(target.raw, allowInteraction: allowKeychainPrompt)
         recordActive(name)
 
