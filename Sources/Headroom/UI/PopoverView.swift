@@ -297,10 +297,47 @@ struct PopoverView: View {
                     .padding(.top, Theme.Space.s1)
             }
 
+            keychainWarning
+
             autoMode
 
             Divider().padding(.vertical, Theme.Space.s1)
             modelRow
+        }
+    }
+
+    /// Shown when Claude Code can no longer read its own token silently.
+    ///
+    /// Worth a row of its own rather than folding into `lastSwapError`: that
+    /// one describes something the user just did, and clears. This describes a
+    /// standing condition they did not cause and cannot diagnose -- from the
+    /// outside it looks like macOS asking for a password at random, with
+    /// nothing connecting it to this app having rewritten an ACL. Naming it,
+    /// and offering the one click that fixes it, is the whole point.
+    @ViewBuilder
+    private var keychainWarning: some View {
+        if store.claudeCodeKeychainBlocked {
+            VStack(alignment: .leading, spacing: Theme.Space.s1) {
+                Label(
+                    "Claude Code can't read its token — macOS will keep asking for your password",
+                    systemImage: "lock.trianglebadge.exclamationmark"
+                )
+                .font(Theme.caption)
+                .foregroundStyle(Theme.accent(for: 100) ?? Theme.inkSecondary)
+
+                Button {
+                    store.repairKeychainAccess()
+                } label: {
+                    if store.isRepairingKeychainAccess {
+                        Label("Waiting for Keychain…", systemImage: "ellipsis")
+                    } else {
+                        Text("Repair Keychain access")
+                    }
+                }
+                .font(Theme.caption)
+                .disabled(store.isRepairingKeychainAccess)
+            }
+            .padding(.top, Theme.Space.s1)
         }
     }
 

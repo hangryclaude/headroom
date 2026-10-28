@@ -91,6 +91,19 @@ final class Store {
     /// account silently changing under the user.
     private(set) var lastAutoSwap: (name: String, at: Date)?
 
+    /// True when the Keychain ACL has drifted such that Claude Code can no
+    /// longer read its own token without a password dialog.
+    ///
+    /// Surfaced rather than silently repaired because the repair is only legal
+    /// from a user-initiated action: rewriting an ACL Headroom is not already
+    /// trusted to change blocks on a dialog, and on the background tick that is
+    /// an indefinite hang. Auto swap writes non-interactively and therefore
+    /// skips the repair entirely, so for an auto-swap user this flag is the
+    /// *only* thing standing between a broken ACL and an unexplained password
+    /// prompt on every Claude Code read, forever.
+    private(set) var claudeCodeKeychainBlocked = false
+    private(set) var isRepairingKeychainAccess = false
+
     var settings: Settings { didSet { settings.save() } }
 
     private let reader = QuotaReader()
@@ -144,14 +157,15 @@ final class Store {
             Task { @MainActor in self?.onTick() }
         }
         Task { await refreshUsage() }
-        // Deliberately NOT fetched here. Reading the Devin key out of the
-        // Keychain triggers a "wants to use your confidential information"
+        // Devin is deliberately NOT fetched here. Reading the Devin key out of
+        // the Keychain triggers a "wants to use your confidential information"
         // dialog the first time each signed binary asks, and firing that at
         // launch is the surprise `VaultCLI` already refuses to cause. The
         // popover-open path asks instead, where a prompt is expected — and it
-        // is why a headless `--render` can no longer hang on a dialog nobody
-        // is there to answer.
+        // is why a headless `--render` can no longer hang on a dialog nobody is
+        // there to answer.
         refreshTokens()
+        refreshKeychainHealth()
     }
 
     func stop() { timer?.invalidate(); timer = nil }
@@ -165,6 +179,10 @@ final class Store {
         // Slower than the quota poll: sessions change on human timescales, and
         // this endpoint is not the one keeping the user out of trouble.
         if tick % 120 == 0 { Task { await refreshDevin() } }
+        // Cheap and prompt-free — it reads authorisation metadata, never the
+        // secret — but there is no reason to ask more often than the swap that
+        // could invalidate it.
+        if tick % 30 == 0 { refreshKeychainHealth() }
     }
 
     /// Devin's session list. Skipped entirely when unconfigured, so an install
@@ -529,6 +547,43 @@ final class Store {
         switchTo(target, allowKeychainPrompt: false)
         if lastSwapError == nil, activeAccountName != before {
             lastAutoSwap = (name: target, at: now)
+        }
+    }
+
+    /// Re-reads whether Claude Code can still get at its token silently.
+    ///
+    /// A missing item reads as healthy: Claude Code has never signed in here,
+    /// which is not a fault this app should be warning about.
+    func refreshKeychainHealth() {
+        claudeCodeKeychainBlocked = Keychain.claudeCodeCanReadSilently() == false
+    }
+
+    /// Repairs the ACL after the user asks for it, and re-checks rather than
+    /// assuming it worked -- the repair swallows its own failures by design, so
+    /// the only honest report comes from reading the item back.
+    ///
+    /// Reachable only for an item Headroom has not written since this landed:
+    /// every write repairs the ACL as a side effect, and needs no authorisation
+    /// to do it. What is left is the standing case, and it costs one password
+    /// prompt because the item has to be read before it can be re-created --
+    /// once, after which nothing asks again.
+    func repairKeychainAccess() {
+        guard !isRepairingKeychainAccess else { return }
+        isRepairingKeychainAccess = true
+
+        // The read inside can own a macOS password dialog. Running it on the main
+        // actor freezes the menu-bar panel and leaves the secure field unable to
+        // accept input.
+        Task {
+            let ok = await Task.detached(priority: .userInitiated) {
+                Keychain.repairClaudeCodeAccess()
+            }.value
+
+            claudeCodeKeychainBlocked = !ok
+            isRepairingKeychainAccess = false
+            lastSwapError = ok
+                ? nil
+                : "could not repair Keychain access — sign in again with `claude` to rebuild the item"
         }
     }
 

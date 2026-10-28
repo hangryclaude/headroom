@@ -51,6 +51,33 @@ enum VaultError: Error, CustomStringConvertible {
     }
 }
 
+/// The one surface a swap installs a credential onto.
+///
+/// Exists so `activate` can be exercised without a real Keychain. It had no
+/// tests at all, which is how the post-swap identity bug reached a user: the
+/// suite reported every check passing while the swap engine -- the part that can
+/// destroy an account -- was never run. Anything that overwrites the only copy
+/// of a live OAuth token deserves a harness that does not need the user's own
+/// token to run.
+protocol CredentialStore: Sendable {
+    func exists() -> Bool
+    func modifiedAt() -> Date?
+    func read(allowInteraction: Bool) throws -> Data
+    func write(_ data: Data, allowInteraction: Bool) throws
+}
+
+/// The real one. A thin shim, so the seam costs nothing in production.
+struct KeychainStore: CredentialStore {
+    func exists() -> Bool { Keychain.exists() }
+    func modifiedAt() -> Date? { Keychain.modifiedAt() }
+    func read(allowInteraction: Bool) throws -> Data {
+        try Keychain.read(allowInteraction: allowInteraction)
+    }
+    func write(_ data: Data, allowInteraction: Bool) throws {
+        try Keychain.write(data, allowInteraction: allowInteraction)
+    }
+}
+
 /// Stores Claude accounts and swaps between them.
 ///
 /// Two rules here are not preferences, they are the difference between working
@@ -78,14 +105,17 @@ final class AccountVault: @unchecked Sendable {
     let root: URL
     private let indexURL: URL
     private let guardian: SessionGuard
+    private let store: CredentialStore
 
     init(root: URL = ClaudePaths.support.appending(path: "vault"),
          guardian: SessionGuard = SessionGuard(),
-         identityURL: URL = ClaudePaths.configJSON) {
+         identityURL: URL = ClaudePaths.configJSON,
+         store: CredentialStore = KeychainStore()) {
         self.root = root
         self.indexURL = root.appending(path: "accounts.json")
         self.guardian = guardian
         self.identityURL = identityURL
+        self.store = store
     }
 
     /// Reserved slot for a signed-in account that was never saved, so its
@@ -132,21 +162,104 @@ final class AccountVault: @unchecked Sendable {
     /// account never raises an authorisation dialog.
     func activeAccount() -> StoredAccount? {
         let stored = accounts()
-        guard !stored.isEmpty, let uuid = IdentityReader(configURL: identityURL).read()?.accountUUID
-        else { return nil }
-        return stored.first { $0.accountUUID == uuid }
+        guard !stored.isEmpty, let name = resolvedActiveName(among: stored) else { return nil }
+        return stored.first { $0.name == name }
     }
 
     /// True when this stored account is the one currently signed in.
     private func isActive(_ account: StoredAccount) -> Bool {
-        guard let uuid = account.accountUUID else { return false }
-        return IdentityReader(configURL: identityURL).read()?.accountUUID == uuid
+        resolvedActiveName(among: accounts()) == account.name
+    }
+
+    /// Which account is installed right now, answered without depending solely
+    /// on a key this class deletes.
+    ///
+    /// `repointConfig` clears `oauthAccount` at the end of every swap, on
+    /// purpose: a cleared cache refetches correctly where a restored stale one
+    /// stays wrong forever. But identity used to be read *only* from that key,
+    /// so for the whole window between a swap and Claude Code's next launch,
+    /// Headroom believed no account was installed. That was not cosmetic. The
+    /// forced usage refresh that follows a swap skips "the active account", so
+    /// with nothing active it reached for the account just installed, found the
+    /// vault's copy of its token expired -- which is usually *why* you switch to
+    /// a dormant account -- and redeemed the refresh token. The rotated pair went
+    /// to the vault file only, leaving the Keychain holding a refresh token the
+    /// server had already consumed. The account broke on next use and asked to
+    /// sign in again, which reads to the user as "the swap didn't work".
+    ///
+    /// The marker written at swap time settles it. Its authority rests on the
+    /// Keychain's own modification date: if the item has not been rewritten since
+    /// Headroom installed a token into it, then that token is still what is
+    /// installed, and no cache anywhere can argue. The moment anything else
+    /// writes the item -- Claude Code rotating a token, or a fresh `claude login`
+    /// -- the date moves, the marker stops being evidence, and `oauthAccount`
+    /// takes over as it should, because by then Claude Code has run and written
+    /// it. Reading a modification date is an attribute read, so this stays free
+    /// and cannot raise a dialog.
+    private func resolvedActiveName(among stored: [StoredAccount]) -> String? {
+        let marker = activeMarker().flatMap { marker in
+            stored.contains { $0.name == marker.name } ? marker : nil
+        }
+        // Bound separately: `read()?.accountUUID.flatMap` would apply the chain's
+        // flatMap to the unwrapped String, not to the Optional.
+        let configUUID = IdentityReader(configURL: identityURL).read()?.accountUUID
+        let fromConfig = configUUID.flatMap { uuid in
+            stored.first { $0.accountUUID == uuid }?.name
+        }
+
+        guard let marker else { return fromConfig }
+        guard let fromConfig else {
+            // Nothing else has an opinion, so the marker's name stands even if
+            // the Keychain has been written since. What a later write changes is
+            // the *token*, not which account is installed -- Claude Code
+            // refreshing a token rotates it in place for the same account.
+            // Requiring a matching date here reopened the original bug in a
+            // narrower window: a rotation that lands before Claude Code writes
+            // `oauthAccount` back would leave nobody able to name the installed
+            // account, and the outgoing re-snapshot would be skipped again.
+            return marker.name
+        }
+        // Both have an opinion, so they can disagree -- a long-running Claude
+        // Code process can rewrite the config from a stale in-memory cache and
+        // put the previous account back. The marker wins for exactly as long as
+        // the Keychain still holds what Headroom put there; once anything else
+        // has written the item, Claude Code's record is the better evidence.
+        return marker.keychainModifiedAt == store.modifiedAt() ? marker.name : fromConfig
+    }
+
+    /// The account Headroom last installed, and the Keychain modification date
+    /// that write produced. Only meaningful while the two still agree.
+    private struct ActiveMarker: Codable {
+        var name: String
+        var keychainModifiedAt: Date?
+    }
+
+    private var activeMarkerURL: URL { root.appending(path: "active.json") }
+
+    private func activeMarker() -> ActiveMarker? {
+        guard let data = FileManager.default.contents(atPath: activeMarkerURL.path) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ActiveMarker.self, from: data)
+    }
+
+    /// Recorded immediately after the Keychain write and before anything else
+    /// that can fail, so a swap that stumbles later is still attributed to the
+    /// account actually installed.
+    ///
+    /// Not private so that `--selftest` can drive it against a temporary vault:
+    /// the alternative is hand-encoding the marker in the test, which would let
+    /// the format drift out from under the thing it is meant to be proving.
+    func recordActive(_ name: String) {
+        let marker = ActiveMarker(name: name, keychainModifiedAt: store.modifiedAt())
+        guard let data = try? JSONEncoder().encode(marker) else { return }
+        try? data.write(to: activeMarkerURL, options: .atomic)
     }
 
     // MARK: Credentials
 
     private func currentCredentials(allowInteraction: Bool = true) throws -> Credentials {
-        Credentials(raw: try Keychain.read(allowInteraction: allowInteraction))
+        Credentials(raw: try store.read(allowInteraction: allowInteraction))
     }
 
     private func credentialURL(_ name: String) -> URL {
@@ -256,16 +369,30 @@ final class AccountVault: @unchecked Sendable {
         let identity = IdentityReader(configURL: identityURL).read()
         var list = accounts()
 
+        // `oauthAccount` is missing for the whole window between a swap and
+        // Claude Code's next launch, because this class clears it. A capture made
+        // in that window used to store an entry with no UUID at all -- which the
+        // duplicate guard below cannot compare and `activeAccount` can never
+        // match again, so the slot stayed unidentifiable for good. The marker
+        // already knows which account is installed; use it.
+        let installed = identity == nil
+            ? list.first { $0.name == resolvedActiveName(among: list) }
+            : nil
+        let accountUUID = identity?.accountUUID ?? installed?.accountUUID
+        let email = identity?.email ?? installed?.email
+        let planLabel = identity?.planLabel ?? installed?.plan
+        let rateLimitTier = identity?.rateLimitTier ?? installed?.rateLimitTier
+
         // Refuse to store the same account twice under different names.
         //
         // Without this, a sign-in that never completed silently saves the
         // *current* credential again, and the vault grows a phantom account that
         // looks switchable but shares a UUID with the real one. Switching to it
         // is a no-op, and the policy sees two entries where there is one login.
-        if let uuid = identity?.accountUUID,
-           let clash = list.first(where: { $0.accountUUID == uuid && $0.name != name }) {
+        if let accountUUID,
+           let clash = list.first(where: { $0.accountUUID == accountUUID && $0.name != name }) {
             throw VaultError.duplicateAccount(
-                existing: clash.name, email: identity?.email ?? uuid)
+                existing: clash.name, email: email ?? accountUUID)
         }
 
         // Saving over an existing name replaces that account's stored
@@ -278,10 +405,10 @@ final class AccountVault: @unchecked Sendable {
 
         let account = StoredAccount(
             name: name,
-            email: identity?.email,
-            plan: identity?.planLabel,
-            rateLimitTier: identity?.rateLimitTier,
-            accountUUID: identity?.accountUUID,
+            email: email,
+            plan: planLabel,
+            rateLimitTier: rateLimitTier,
+            accountUUID: accountUUID,
             fingerprint: credentials.fingerprint,
             savedAt: Date(),
             lastActiveAt: Date()
@@ -290,6 +417,9 @@ final class AccountVault: @unchecked Sendable {
         try persist(credentials, for: name)
         list.append(account)
         try write(list)
+        // Capturing does not change which account is installed, but it does
+        // change its name, and the marker points at a name.
+        recordActive(name)
         return account
     }
 
@@ -386,6 +516,23 @@ final class AccountVault: @unchecked Sendable {
             throw VaultError.noCredentials
         }
 
+        // The identity cache can outlive the Keychain item. This happens after a
+        // broken ACL is repaired by removing the inaccessible item: the account
+        // still looks active by UUID, but Claude has no credential to read. In
+        // that state there is no outgoing secret to preserve, so restore the
+        // selected vault copy directly instead of reporting "already active" or
+        // trying to read an item that does not exist.
+        if !store.exists() {
+            try store.write(target.raw, allowInteraction: allowKeychainPrompt)
+            recordActive(name)
+            try Self.repointConfig(at: identityURL)
+
+            list[targetIndex].lastActiveAt = Date()
+            list[targetIndex].fingerprint = target.fingerprint
+            try write(list)
+            return list[targetIndex]
+        }
+
         if isActive(list[targetIndex]) { throw VaultError.alreadyActive(name) }
 
         // Read the outgoing credential up front, and refuse the swap if it
@@ -415,9 +562,15 @@ final class AccountVault: @unchecked Sendable {
         // the fingerprint meant this whole block was skipped precisely when it
         // mattered -- after Claude Code had rotated the token, which is the case
         // that makes the vault copy stale in the first place.
-        let currentUUID = IdentityReader(configURL: identityURL).read()?.accountUUID
-        if let currentUUID,
-           let outgoingIndex = list.firstIndex(where: { $0.accountUUID == currentUUID }) {
+        //
+        // Resolved through the marker rather than straight off `oauthAccount`,
+        // because this block was skipped entirely on any second swap made before
+        // Claude Code relaunched: the previous swap had deleted that key, so the
+        // outgoing account matched nothing and its live credential was written
+        // only into a dated backup directory nobody looks in. Rule 1 exists to
+        // stop exactly the loss that then followed.
+        let currentName = resolvedActiveName(among: list)
+        if let outgoingIndex = list.firstIndex(where: { $0.name == currentName }) {
             try persist(live, for: list[outgoingIndex].name)
             list[outgoingIndex].fingerprint = live.fingerprint
             list[outgoingIndex].lastActiveAt = Date()
@@ -427,15 +580,33 @@ final class AccountVault: @unchecked Sendable {
                 list[outgoingIndex].usageFetchedAt = snapshot.fetchedAt
             }
             try write(list)
-        } else if currentUUID != nil {
+        } else {
             // Signed in to something we have never saved. Its credential is about
             // to be overwritten and would be gone for good, so park a copy under
             // a reserved name rather than discarding it.
+            //
+            // No longer conditional on knowing *who* it is. The guard used to
+            // require a readable identity, so the one case where the account is
+            // genuinely unidentifiable -- the case where a parked copy is the
+            // only remaining record of it -- was the case that skipped parking.
             try persist(live, for: Self.unsavedSlot)
         }
 
-        try Keychain.write(target.raw, allowInteraction: allowKeychainPrompt)
-        try Self.repointConfig()
+        // Clear the identity cache *before* installing the token, so that a
+        // failure at either step reports itself truthfully.
+        //
+        // The other order lies in the direction that costs the most. If the
+        // Keychain write lands and this then throws, the swap has happened --
+        // Claude Code is running as the new account -- but `activate` throws, so
+        // the user is told it failed and reasonably tries again. This way round,
+        // a failure here means nothing has been installed yet and "it failed" is
+        // the truth; and if the write fails afterwards, the only damage is a
+        // cleared cache in front of an unchanged token, which Claude Code
+        // repopulates correctly on its next launch.
+        try Self.repointConfig(at: identityURL)
+
+        try store.write(target.raw, allowInteraction: allowKeychainPrompt)
+        recordActive(name)
 
         list[targetIndex].lastActiveAt = Date()
         list[targetIndex].fingerprint = target.fingerprint
@@ -489,6 +660,18 @@ final class AccountVault: @unchecked Sendable {
 
     // MARK: Backups
 
+    /// Backups sit beside the vault, not at a fixed absolute path.
+    ///
+    /// Derived from `root` so that a vault pointed at a temporary directory is
+    /// genuinely self-contained. It was not: `--selftest` exercising the swap
+    /// engine wrote backup directories into the real Application Support folder,
+    /// which is the same mistake as `repointConfig` reaching past its injected
+    /// URL to the live `~/.claude.json`. In production `root` is
+    /// `support/vault`, so this resolves to `support/backups` exactly as before.
+    private var backupRoot: URL {
+        root.deletingLastPathComponent().appending(path: "backups")
+    }
+
     /// Timestamped copies of both surfaces before anything is written. Cheap, and
     /// the one thing that makes a bad swap recoverable.
     private func backupEverything(_ live: Credentials) throws {
@@ -511,8 +694,8 @@ final class AccountVault: @unchecked Sendable {
     private func newBackupDirectory() throws -> URL {
         let stamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
-        let directory = ClaudePaths.support
-            .appending(path: "backups/\(stamp)-\(UUID().uuidString.prefix(8))")
+        let directory = backupRoot
+            .appending(path: "\(stamp)-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try? FileManager.default.setAttributes(
             [.posixPermissions: 0o700], ofItemAtPath: directory.path)
@@ -530,9 +713,8 @@ final class AccountVault: @unchecked Sendable {
     /// Unbounded backups of credentials are a growing liability, not a safety
     /// net. Keep enough to recover from a bad swap, discard the rest.
     private func pruneBackups() {
-        let root = ClaudePaths.support.appending(path: "backups")
         guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: [.creationDateKey]) else { return }
+            at: backupRoot, includingPropertiesForKeys: [.creationDateKey]) else { return }
         let sorted = entries.sorted {
             ($0.lastPathComponent) > ($1.lastPathComponent)
         }

@@ -51,13 +51,29 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc, because `security find-identity -p codesigning` reports no identities
-# on this machine. Worth knowing what that costs: an ad-hoc signature is bound to
-# the code hash, which changes on every rebuild, so the Keychain "Always Allow"
-# grant for reading Claude Code's credential item does not survive a rebuild --
-# macOS will prompt again each time. Creating a stable self-signed certificate
-# and signing with that fixes it; see README.
-codesign --force --sign - "$APP" 2>/dev/null
+# A stable designated requirement, so the bundle keeps one identity across
+# rebuilds rather than a fresh code hash each time.
+#
+# Explicitly NOT load-bearing for Keychain access any more. It used to be the
+# plan: sign stably, get on the credential item's ACL, stop the password
+# prompts. That never worked for the CLI, which SwiftPM ad-hoc signs, so the two
+# binaries held different identities and each swap locked the other out.
+# Keychain.swift now puts nobody but /usr/bin/security on the ACL and reads
+# through it, which is why none of this matters to it -- do not re-couple them.
+#
+# Falls back to ad-hoc rather than failing the build: an unsigned-but-working
+# app beats no app on a machine without the certificate. Diagnostics are kept
+# rather than sent to /dev/null, because "silently produced something different
+# from what you asked for" is how the last several hours got spent.
+SIGNING_IDENTITY="Headroom Local Code Signing"
+if ! codesign --force --sign "$SIGNING_IDENTITY" "$APP"; then
+    echo "warn   '$SIGNING_IDENTITY' unavailable — falling back to ad-hoc signing"
+    codesign --force --sign - "$APP"
+fi
+codesign --verify --deep --strict "$APP" || {
+    echo "error  the signature did not verify"
+    exit 1
+}
 
 echo "built  $APP  ($CONFIG)"
 

@@ -26,10 +26,13 @@ enum SelfTest {
         identity()
         oauthProfile()
         backfill()
+        activeAccountResolution()
+        swapEngine()
         planValue()
         rolledOverReadings()
         pricing()
         devin()
+        keychainAccessControl()
 
         print("")
         print(failures == 0
@@ -514,6 +517,279 @@ enum SelfTest {
     /// collide with another slot has to refuse rather than write. Two entries
     /// sharing a UUID is the shape that made the live account unrecognisable and
     /// got its consumed refresh token replayed.
+    /// Which account the vault believes is installed, in the window where
+    /// `~/.claude.json` cannot answer.
+    ///
+    /// This is the regression test for the worst of the swap bugs. `activate`
+    /// finishes by deleting `oauthAccount`, and identity used to be read only
+    /// from there, so every swap was followed by a window in which Headroom
+    /// believed nothing was active. The forced usage refresh that runs right
+    /// after a swap skips the active account -- so with nothing active it
+    /// reached for the account just installed, found the vault's copy of its
+    /// token expired (the usual reason to switch to a dormant account), and
+    /// redeemed its refresh token. The rotated pair was written to the vault
+    /// file only, so the Keychain kept a refresh token the server had already
+    /// consumed. Anthropic's reuse detection then revoked the family: the
+    /// account did not merely need signing in again, it was dead.
+    ///
+    /// The marker has to beat a *stale* `oauthAccount`, not merely a missing
+    /// one, which is the second half of what is asserted here: a long-running
+    /// Claude Code process can rewrite that file from memory after a swap and
+    /// put the previous account's UUID back.
+    private static func activeAccountResolution() {
+        section("Active account resolution")
+
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "headroom-active-\(UUID().uuidString)")
+        let config = root.appending(path: "claude.json")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let vault = AccountVault(root: root, identityURL: config)
+        let one = Identity(email: "one@x.com", accountUUID: "uuid-one", organizationUUID: nil,
+                           organizationType: nil, rateLimitTier: nil)
+        let two = Identity(email: "two@x.com", accountUUID: "uuid-two", organizationUUID: nil,
+                           organizationType: nil, rateLimitTier: nil)
+        guard (try? vault.adopt(Credentials(raw: Data(#"{"accessToken":"a"}"#.utf8)),
+                                identity: one, as: "one")) != nil,
+              (try? vault.adopt(Credentials(raw: Data(#"{"accessToken":"b"}"#.utf8)),
+                                identity: two, as: "two")) != nil else {
+            expect(false, "two accounts adopt into a fresh vault"); return
+        }
+
+        func writeConfig(uuid: String?, email: String) {
+            var root: [String: Any] = ["projects": ["keep": "me"]]
+            if let uuid {
+                root["oauthAccount"] = ["accountUuid": uuid, "emailAddress": email]
+            }
+            let data = try? JSONSerialization.data(withJSONObject: root)
+            try? data?.write(to: config, options: .atomic)
+        }
+
+        writeConfig(uuid: "uuid-one", email: "one@x.com")
+        expect(vault.activeAccount()?.name == "one",
+               "with no marker, the account named by oauthAccount is the active one")
+
+        writeConfig(uuid: nil, email: "")
+        expect(vault.activeAccount() == nil,
+               "with no marker and no oauthAccount, nothing is active — the old behaviour")
+
+        // The swap window: oauthAccount has just been deleted by repointConfig.
+        vault.recordActive("two")
+        expect(vault.activeAccount()?.name == "two",
+               "a marker names the installed account while oauthAccount is missing")
+
+        // And the harder case: Claude Code writes the *previous* account's
+        // identity back from a stale in-memory cache after the swap.
+        writeConfig(uuid: "uuid-one", email: "one@x.com")
+        expect(vault.activeAccount()?.name == "two",
+               "a valid marker outranks a resurrected, stale oauthAccount")
+
+        // A marker whose Keychain no longer matches loses to a *conflicting*
+        // oauthAccount: something else has written the item since, so Claude
+        // Code's own record is the better evidence.
+        let stale = #"{"name":"two","keychainModifiedAt":-63000000}"#
+        try? Data(stale.utf8).write(to: root.appending(path: "active.json"), options: .atomic)
+        expect(vault.activeAccount()?.name == "one",
+               "a marker the Keychain has moved on from loses to a conflicting oauthAccount")
+
+        // But with nothing to conflict with, the marker's name still stands. A
+        // later write rotates the *token*; it does not change which account is
+        // installed. Requiring a matching date here reopened the original bug in
+        // a narrower window — a rotation landing before Claude Code writes
+        // oauthAccount back left nobody able to name the installed account, and
+        // the outgoing re-snapshot was skipped all over again.
+        writeConfig(uuid: nil, email: "")
+        expect(vault.activeAccount()?.name == "two",
+               "a marker still names the installed account after a token rotation, "
+               + "when oauthAccount has nothing to say")
+
+        // A marker naming an account that has since been forgotten must not
+        // resurrect it as active. oauthAccount is restored first, so the
+        // assertion is about the marker being discarded rather than about there
+        // being nothing left to fall back to.
+        writeConfig(uuid: "uuid-one", email: "one@x.com")
+        vault.recordActive("two")
+        expect((try? vault.forget("two")) != nil, "the marked account can be forgotten")
+        expect(vault.activeAccount()?.name == "one",
+               "a marker pointing at a deleted account falls back rather than dangling")
+    }
+
+    /// A Keychain that lives in memory, so the swap engine can be run for real.
+    ///
+    /// `activate` overwrites the only copy of a live OAuth token. It had no test
+    /// of any kind, because exercising it meant touching the Keychain the user is
+    /// signed in with. That is why every check could pass while the swap path
+    /// carried an account-destroying bug.
+    private final class FakeCredentialStore: CredentialStore, @unchecked Sendable {
+        var data: Data?
+        var modified: Date?
+        var readError: Error?
+        var writeError: Error?
+        private(set) var writes = 0
+
+        init(_ data: Data?) {
+            self.data = data
+            self.modified = data == nil ? nil : Date(timeIntervalSince1970: 1)
+        }
+
+        func exists() -> Bool { data != nil }
+        func modifiedAt() -> Date? { modified }
+
+        func read(allowInteraction: Bool) throws -> Data {
+            if let readError { throw readError }
+            guard let data else { throw Keychain.Failure.notFound }
+            return data
+        }
+
+        func write(_ new: Data, allowInteraction: Bool) throws {
+            if let writeError { throw writeError }
+            writes += 1
+            data = new
+            // A distinct instant per write, which is what the marker keys off.
+            modified = Date(timeIntervalSince1970: 1 + Double(writes))
+        }
+
+        /// Claude Code refreshing the token in place: same account, new bytes.
+        func rotateInPlace(_ new: Data) {
+            data = new
+            modified = Date(timeIntervalSince1970: 500)
+        }
+    }
+
+    /// The swap engine, run end to end against an in-memory Keychain.
+    private static func swapEngine() {
+        section("Swap engine")
+
+        struct Fixture {
+            let vault: AccountVault
+            let store: FakeCredentialStore
+            let root: URL
+            let config: URL
+        }
+
+        func makeFixture() -> Fixture? {
+            let root = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appending(path: "headroom-swap-\(UUID().uuidString)")
+            try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let config = root.appending(path: "claude.json")
+            let store = FakeCredentialStore(Data(#"{"accessToken":"live-a","refreshToken":"ra"}"#.utf8))
+            // An empty sessions directory, so the guard sees no live Claude Code
+            // and the swap is not refused as busy. Without this the suite passes
+            // or fails depending on whether the person running it happens to
+            // have a session mid-request, which is not a test.
+            let sessions = root.appending(path: "sessions")
+            try? FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+            let vault = AccountVault(root: root,
+                                     guardian: SessionGuard(sessionsDir: sessions),
+                                     identityURL: config, store: store)
+
+            for (name, uuid, token) in [("a", "uuid-a", "a"), ("b", "uuid-b", "b"), ("c", "uuid-c", "c")] {
+                let identity = Identity(email: "\(name)@x.com", accountUUID: uuid,
+                                        organizationUUID: nil, organizationType: nil,
+                                        rateLimitTier: nil)
+                let raw = Data(#"{"accessToken":"vault-\#(token)","refreshToken":"r\#(token)"}"#.utf8)
+                guard (try? vault.adopt(Credentials(raw: raw), identity: identity, as: name)) != nil
+                else { return nil }
+            }
+            let root0: [String: Any] = [
+                "projects": ["keep": "me"],
+                "oauthAccount": ["accountUuid": "uuid-a", "emailAddress": "a@x.com"],
+            ]
+            try? JSONSerialization.data(withJSONObject: root0).write(to: config, options: .atomic)
+            return Fixture(vault: vault, store: store, root: root, config: config)
+        }
+
+        func storedToken(_ f: Fixture, _ name: String) -> String? {
+            let url = f.root.appending(path: name).appending(path: "credentials.json")
+            guard let data = FileManager.default.contents(atPath: url.path) else { return nil }
+            return String(decoding: data, as: UTF8.self)
+        }
+
+        // 1. The ordinary swap.
+        guard let f1 = makeFixture() else { expect(false, "a swap fixture builds"); return }
+        defer { try? FileManager.default.removeItem(at: f1.root) }
+        guard let installed = try? f1.vault.activate("b") else {
+            expect(false, "a swap to a stored account succeeds"); return
+        }
+        expect(installed.name == "b", "activate reports the account it installed")
+        expect(f1.store.data == Data(#"{"accessToken":"vault-b","refreshToken":"rb"}"#.utf8),
+               "the Keychain ends up holding the target account's credential")
+        expect(f1.vault.activeAccount()?.name == "b",
+               "the swapped-to account is active immediately, before Claude Code relaunches")
+
+        // Rule 1: the outgoing account's *live* token, not the vault's older copy.
+        expect(storedToken(f1, "a")?.contains("live-a") == true,
+               "the outgoing account is re-snapshotted from the live credential")
+
+        // repointConfig ran, so the identity cache is cleared for the newcomer.
+        let after = (try? JSONSerialization.jsonObject(
+            with: Data(contentsOf: f1.config))) as? [String: Any]
+        expect(after?["oauthAccount"] == nil, "the swap clears the stale identity cache")
+        expect(after?["projects"] != nil, "the swap leaves unrelated config keys alone")
+
+        // 2. Swapping to what is already installed is refused.
+        if case .some = try? f1.vault.activate("b") {
+            expect(false, "swapping to the active account is refused")
+        } else {
+            expect(true, "swapping to the active account is refused")
+        }
+
+        // 3. The regression: a second swap before Claude Code has relaunched.
+        //
+        // `oauthAccount` is still absent here, which used to mean the outgoing
+        // account matched nothing, so its live credential was never written to
+        // its own slot -- only into a dated backup directory.
+        f1.store.rotateInPlace(Data(#"{"accessToken":"live-b-rotated","refreshToken":"rb2"}"#.utf8))
+        guard (try? f1.vault.activate("c")) != nil else {
+            expect(false, "a second swap before Claude Code relaunches succeeds"); return
+        }
+        expect(storedToken(f1, "b")?.contains("live-b-rotated") == true,
+               "the second swap re-snapshots the outgoing account's rotated token into its own slot")
+        expect(f1.vault.activeAccount()?.name == "c", "the second swap is reflected immediately")
+
+        // 4. An unreadable outgoing credential refuses the swap without writing.
+        guard let f4 = makeFixture() else { expect(false, "a second fixture builds"); return }
+        defer { try? FileManager.default.removeItem(at: f4.root) }
+        f4.store.readError = Keychain.Failure.denied
+        let before4 = f4.store.data
+        if case .some = try? f4.vault.activate("b") {
+            expect(false, "a swap refuses when the outgoing credential cannot be read")
+        } else {
+            expect(true, "a swap refuses when the outgoing credential cannot be read")
+        }
+        expect(f4.store.data == before4,
+               "the refused swap leaves the Keychain untouched — never overwrite what you could not copy")
+
+        // 5. A failed install fails in the safe direction: the identity cache is
+        //    cleared in front of an unchanged token, which Claude Code
+        //    repopulates correctly. The alternative order reports a swap that
+        //    actually happened as a failure.
+        guard let f5 = makeFixture() else { expect(false, "a third fixture builds"); return }
+        defer { try? FileManager.default.removeItem(at: f5.root) }
+        f5.store.writeError = Keychain.Failure.denied
+        let before5 = f5.store.data
+        if case .some = try? f5.vault.activate("b") {
+            expect(false, "a swap whose install fails is reported as a failure")
+        } else {
+            expect(true, "a swap whose install fails is reported as a failure")
+        }
+        expect(f5.store.data == before5, "the failed install left the previous token in place")
+
+        // 6. Signed in to an account the vault has never seen: its credential is
+        //    about to be overwritten, so a copy is parked rather than discarded.
+        guard let f6 = makeFixture() else { expect(false, "a fourth fixture builds"); return }
+        defer { try? FileManager.default.removeItem(at: f6.root) }
+        try? JSONSerialization.data(withJSONObject: ["projects": ["keep": "me"]])
+            .write(to: f6.config, options: .atomic)
+        try? FileManager.default.removeItem(at: f6.root.appending(path: "active.json"))
+        guard (try? f6.vault.activate("b")) != nil else {
+            expect(false, "a swap away from an unknown account succeeds"); return
+        }
+        expect(storedToken(f6, AccountVault.unsavedSlot)?.contains("live-a") == true,
+               "an unrecognised outgoing credential is parked rather than discarded")
+    }
+
     private static func backfill() {
         section("Identity backfill")
 
@@ -847,7 +1123,554 @@ enum SelfTest {
                "an empty org parses to an empty list, not an error")
     }
 
+    /// The access control list on a credentials item Headroom had to create.
+    ///
+    /// The prompt this guards against is the one that says *"security wants to
+    /// access key Claude Code-credentials"* -- `security` being the command line
+    /// tool Claude Code itself shells out to. It appears because a keychain item
+    /// created by `SecItemAdd` trusts exactly one binary: the one that created
+    /// it. On a swap where Claude Code had no item of its own, that is Headroom,
+    /// so the next Claude Code read is an untrusted read and macOS stops to ask.
+    ///
+    /// "Always Allow" does not survive this, because the next swap through the
+    /// same path builds a brand new item with a brand new ACL.
+    ///
+    /// Run against a scratch keychain rather than the login one. This test
+    /// creates and reads credentials items, and doing that for real would put it
+    /// next to -- and one API mistake away from -- the token the user is signed
+    /// in with.
+    /// Annotated deprecated purely to silence the legacy `SecKeychain*` calls
+    /// below: setting an ACL has no modern replacement, so the whole family is
+    /// deprecated with nothing to migrate to. Swift only suppresses those inside
+    /// an equally deprecated context, which costs one warning at the call site --
+    /// cheaper than the nine it silences.
+    @available(macOS, deprecated: 10.10)
+    private static func keychainACL() {
+        section("Keychain ACL")
+
+        guard let scratch = scratchKeychain() else {
+            expect(false, "a scratch keychain can be created")
+            return
+        }
+        defer { destroyScratchKeychain(scratch) }
+
+        let service = "headroom-selftest-\(UUID().uuidString)"
+        do {
+            try Keychain.writeTargeting(
+                Data("not-a-real-token".utf8), service: service,
+                sharedWithClaudeCode: true, in: scratch.keychain)
+        } catch {
+            expect(false, "the credentials item is created: \(error)")
+            return
+        }
+
+        // `SecItemAdd` honours the default keychain, but `SecItemCopyMatching`
+        // searches the *search list*, which setting a default does not join. The
+        // scratch keychain has to be named explicitly or the item that was just
+        // written reads back as missing.
+        var ref: CFTypeRef?
+        let found = SecItemCopyMatching([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: Keychain.defaultAccount,
+            kSecMatchSearchList as String: [scratch.keychain] as CFArray,
+            kSecReturnRef as String: true,
+        ] as CFDictionary, &ref)
+        guard found == errSecSuccess, let item = ref else {
+            expect(false, "the created item can be found again (status \(found))")
+            return
+        }
+
+        var access: SecAccess?
+        // swiftlint:disable:next force_cast
+        let copied = SecKeychainItemCopyAccess((item as! SecKeychainItem), &access)
+        guard copied == errSecSuccess, let access else {
+            expect(false, "the item carries an access control list (status \(copied))")
+            return
+        }
+
+        var aclsRef: CFArray?
+        guard SecAccessCopyACLList(access, &aclsRef) == errSecSuccess,
+              let acls = aclsRef as? [SecACL]
+        else {
+            expect(false, "the access control list can be read back")
+            return
+        }
+
+        // A SecAccess holds one ACL per authorization tag, and they do not all
+        // mean the same thing: the encrypt ACL is open to everything by design,
+        // because writing a secret nobody can read back is harmless. Only the
+        // decrypt ACL decides who reads the token without a prompt, so it is the
+        // only one worth asserting on -- an earlier version of this test looked
+        // at all of them and called the item world-readable when it was not.
+        var trusted: Set<String> = []
+        var allowsEveryApplication = false
+        var foundDecryptACL = false
+        for acl in acls {
+            guard let authorizations = SecACLCopyAuthorizations(acl) as? [String],
+                  authorizations.contains(kSecACLAuthorizationDecrypt as String)
+            else { continue }
+            foundDecryptACL = true
+
+            var apps: CFArray?
+            var description: CFString?
+            var selector = SecKeychainPromptSelector()
+            guard SecACLCopyContents(acl, &apps, &description, &selector) == errSecSuccess
+            else { continue }
+            // A nil application list on the decrypt ACL is "allow all
+            // applications": every process on the machine reads the token freely.
+            guard let apps = apps as? [SecTrustedApplication] else {
+                allowsEveryApplication = true
+                continue
+            }
+            for app in apps {
+                var data: CFData?
+                guard SecTrustedApplicationCopyData(app, &data) == errSecSuccess,
+                      let data = data as Data?
+                else { continue }
+                let raw = String(decoding: data, as: UTF8.self)
+                trusted.insert(raw.trimmingCharacters(in: CharacterSet(charactersIn: "\0")))
+            }
+        }
+
+        expect(foundDecryptACL, "the item has a decrypt ACL to inspect")
+
+        expect(trusted.contains("/usr/bin/security"),
+               "the ACL trusts /usr/bin/security, which is how Claude Code reads the token")
+        expect(!allowsEveryApplication,
+               "the ACL names specific binaries rather than allowing every application")
+        expect(!trusted.isEmpty,
+               "the ACL is a real trust list, not an empty one")
+
+        // Everything above is Headroom marking its own homework: it asserts that
+        // the ACL Headroom wrote says what Headroom meant it to say. That cannot
+        // catch a wrong belief about what macOS enforces, and a wrong belief about
+        // exactly that is what shipped the bug.
+        //
+        // So the check that actually decides the question runs the real tool, out
+        // of process, exactly as Claude Code does. If it comes back blocked -- a
+        // refusal, or a dialog we waited out -- the user gets a password prompt on
+        // every Claude Code start, whatever the ACL looks like from in here.
+        let readBack = Keychain.securityToolCanRead(
+            service: service, keychainPath: scratch.path.path)
+        expect(readBack == Data("not-a-real-token".utf8),
+               "/usr/bin/security really reads the item back, out of process, without a prompt")
+    }
+
+    /// What the partition list does, pinned so a wrong belief cannot ship twice.
+    ///
+    /// The fix this file guards was once written on the theory that macOS ANDs
+    /// the decrypt ACL against an independent partition list, so an item had to
+    /// carry `apple-tool:` before `/usr/bin/security` could read it. Measurement
+    /// says otherwise: with the tool on the trusted-application list, the item is
+    /// readable with a partition list that omits `apple-tool:`, and with no
+    /// partition ACL at all.
+    ///
+    /// That mattered because it was load-bearing in the wrong direction. Health
+    /// detection required `apple-tool:`, and `security add-generic-password -U`
+    /// -- how Claude Code writes a refreshed token, several times a day -- clears
+    /// the partition list while leaving the trusted-application list intact. A
+    /// healthy machine would have reported itself broken within hours, and
+    /// "repaired" an ACL that was already correct on every swap.
+    ///
+    /// If a future macOS starts enforcing partitions, this test fails and the
+    /// belief gets revisited. That is the entire point of it.
+    @available(macOS, deprecated: 10.10)
+    private static func keychainPartitionListIsNotAGate() {
+        section("Keychain partition list")
+
+        guard let scratch = scratchKeychain() else {
+            expect(false, "a scratch keychain can be created")
+            return
+        }
+        defer { destroyScratchKeychain(scratch) }
+
+        let service = "headroom-selftest-\(UUID().uuidString)"
+        var reader: SecTrustedApplication?
+        guard SecTrustedApplicationCreateFromPath(Keychain.claudeCodeReaderPath, &reader)
+                == errSecSuccess, let reader else {
+            expect(false, "/usr/bin/security can be described as a trusted application")
+            return
+        }
+        var access: SecAccess?
+        guard SecAccessCreate(service as CFString, [reader] as CFArray, &access) == errSecSuccess,
+              let access else {
+            expect(false, "an ACL trusting the tool can be built")
+            return
+        }
+
+        // A partition list that deliberately does NOT admit the security tool.
+        // If partitions were a gate, this item would be unreadable by it.
+        guard let description = encodePartitionIDs(["cdhash:0000000000000000000000000000000000000000"])
+        else {
+            expect(false, "a partition list can be encoded")
+            return
+        }
+        var acl: SecACL?
+        guard SecACLCreateWithSimpleContents(
+                access, nil, description, SecKeychainPromptSelector(), &acl) == errSecSuccess,
+              let acl,
+              SecACLUpdateAuthorizations(acl, [kSecACLAuthorizationPartitionID] as CFArray)
+                == errSecSuccess else {
+            expect(false, "a partition ACL can be attached")
+            return
+        }
+
+        guard SecItemAdd([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: Keychain.defaultAccount,
+            kSecValueData as String: Data("partition-probe".utf8),
+            kSecAttrAccess as String: access,
+            kSecUseKeychain as String: scratch.keychain,
+        ] as CFDictionary, nil) == errSecSuccess else {
+            expect(false, "the probe item can be created")
+            return
+        }
+
+        expect(Keychain.securityToolCanRead(service: service, keychainPath: scratch.path.path)
+                == Data("partition-probe".utf8),
+               "a partition list that omits apple-tool: does not stop /usr/bin/security — "
+               + "the trusted-application list is the only gate")
+    }
+
+    /// Hex(UTF-8 XML plist `{Partitions: [...]}`), the encoding `security`'s own
+    /// source uses for a partition ACL's description field.
+    ///
+    /// Lives only in the test: nothing in the product writes a partition list any
+    /// more, because the natural state of an item that has never had one is
+    /// "unrestricted", and writing one could only ever narrow that.
+    private static func encodePartitionIDs(_ partitions: [String]) -> CFString? {
+        guard let xml = try? PropertyListSerialization.data(
+            fromPropertyList: ["Partitions": partitions], format: .xml, options: 0)
+        else { return nil }
+        return xml.map { String(format: "%02x", $0) }.joined() as CFString
+    }
+
+    /// The access control list on a credentials item that already existed.
+    ///
+    /// Fixing only the create path would fix nobody already suffering: their item
+    /// exists, so every write takes `SecItemUpdate`, which leaves the ACL exactly
+    /// as wrong as it was. The prompt would keep arriving forever on any machine
+    /// where the bad item had already been made -- which is every machine that
+    /// has the bug.
+    ///
+    /// So a write also repairs the ACL it finds, by replacing the item rather
+    /// than editing its ACL in place. That distinction is what makes the repair
+    /// free: deleting a generic password needs no authorisation, so there is no
+    /// dialog on any path, including the background one.
+    @available(macOS, deprecated: 10.10)
+    private static func keychainACLRepair() {
+        section("Keychain ACL repair")
+
+        guard let scratch = scratchKeychain() else {
+            expect(false, "a scratch keychain can be created")
+            return
+        }
+        defer { destroyScratchKeychain(scratch) }
+
+        // The "before" state: an item trusting only the app that made it, which
+        // is what the buggy build produced.
+        //
+        // The ACL is built explicitly rather than left to SecItemAdd's default so
+        // that this binary is trusted to *change* it. Changing an ACL you are not
+        // trusted for needs authorisation, and `SecKeychainItemSetAccess` does not
+        // return an error when it is not allowed to ask -- it blocks forever. The
+        // real repair on a real machine is allowed to cost one prompt; a self test
+        // that hangs the build is not.
+        let service = "headroom-selftest-\(UUID().uuidString)"
+        var me: SecTrustedApplication?
+        guard SecTrustedApplicationCreateFromPath(nil, &me) == errSecSuccess, let me else {
+            expect(false, "the test binary can describe itself as a trusted application")
+            return
+        }
+        var ownAccess: SecAccess?
+        guard SecAccessCreate(service as CFString, [me] as CFArray, &ownAccess) == errSecSuccess,
+              let ownAccess
+        else {
+            expect(false, "an ACL trusting only this binary can be built")
+            return
+        }
+        let legacy: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: Keychain.defaultAccount,
+            kSecValueData as String: Data("stale-token".utf8),
+            kSecAttrAccess as String: ownAccess,
+        ]
+        var planted = legacy
+        planted[kSecUseKeychain as String] = scratch.keychain
+        guard SecItemAdd(planted as CFDictionary, nil) == errSecSuccess else {
+            expect(false, "a legacy item can be planted to repair")
+            return
+        }
+
+        guard let before = decryptTrustList(service: service, in: scratch.keychain) else {
+            expect(false, "the planted item's ACL can be read")
+            return
+        }
+        expect(!before.trusted.contains(Keychain.claudeCodeReaderPath),
+               "the planted item starts out not trusting \(Keychain.claudeCodeReaderPath)")
+
+        expect(Keychain.claudeCodeCanReadSilently(
+            service: service, in: scratch.keychain) == false,
+               "the planted item is reported as blocked before anything repairs it")
+
+        // The background path -- auto swap -- writing non-interactively.
+        //
+        // This is the case the previous design could not serve. Repair used to
+        // mean `SecKeychainItemSetAccess`, which needs an authorisation this
+        // process may not hold and blocks on a dialog rather than failing when it
+        // does not, so a non-interactive write had to skip it. A user with auto
+        // swap on and no manual swaps therefore sat behind a broken ACL forever.
+        //
+        // Replacing the item instead of editing its ACL costs no authorisation at
+        // all -- deleting a generic password is not gated by the decrypt ACL --
+        // so the repair now reaches the background path too, and needs no dialog
+        // on any path.
+        do {
+            try Keychain.writeTargeting(Data("fresh-token".utf8), service: service,
+                                        allowInteraction: false,
+                                        sharedWithClaudeCode: true, in: scratch.keychain)
+        } catch {
+            expect(false, "a non-interactive write to the existing item succeeds: \(error)")
+            return
+        }
+
+        guard let after = decryptTrustList(service: service, in: scratch.keychain) else {
+            expect(false, "the item's ACL can still be read")
+            return
+        }
+        expect(after.trusted.contains(Keychain.claudeCodeReaderPath),
+               "a non-interactive write repairs the ACL, with no dialog and no authorisation")
+        expect(!after.allowsEveryApplication,
+               "the item is never widened to every application")
+
+        // The verdict that counts, and the one that also proves the write's own
+        // payload survived the repair: the tool Claude Code shells out to reads
+        // the new secret back, out of process.
+        expect(Keychain.securityToolCanRead(service: service, keychainPath: scratch.path.path)
+                == Data("fresh-token".utf8),
+               "/usr/bin/security reads the repaired item without a prompt")
+
+        // The flip side of the design, worth asserting because breaking it is
+        // silent and slow-acting: Headroom deliberately holds no ACL membership
+        // of its own, so a direct in-process read is refused. If this ever
+        // starts succeeding, something has put Headroom back on the trust list,
+        // and that entry is a code hash which goes stale on the next rebuild --
+        // the exact rot this design removes. Reading through the tool is how
+        // Headroom is meant to get at the secret, and `read` does.
+        var direct: CFTypeRef?
+        let status = SecItemCopyMatching([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: Keychain.defaultAccount,
+            kSecMatchSearchList as String: [scratch.keychain] as CFArray,
+            kSecReturnData as String: true,
+        ] as CFDictionary, &direct)
+        expect(status != errSecSuccess,
+               "Headroom is not on the repaired item's ACL — it reads through the tool instead")
+
+        expect(Keychain.claudeCodeCanReadSilently(
+            service: service, in: scratch.keychain) == true,
+               "the repaired item is reported healthy")
+
+        expect(Keychain.claudeCodeCanReadSilently(
+            service: "headroom-selftest-absent-\(UUID().uuidString)",
+            in: scratch.keychain) == nil,
+               "a missing item reads as absent rather than blocked -- never signing in is not a fault")
+    }
+
+    /// The other direction, which had no test and no detection at all.
+    ///
+    /// After a fresh `claude login` the item is created by `/usr/bin/security`,
+    /// whose ACL names only itself. Claude Code is fine; Headroom is locked out.
+    /// Its swap path reads the outgoing credential before overwriting it and
+    /// refuses the swap when it cannot -- correctly, since overwriting a token it
+    /// could not first copy would destroy an account -- so the user sees
+    /// "refusing to swap — cannot read the current account" and no amount of
+    /// waiting fixes it.
+    ///
+    /// Reading through the same tool is what closes this: Headroom needs no ACL
+    /// membership of its own, so an item that admits `security` admits both.
+    @available(macOS, deprecated: 10.10)
+    private static func keychainToolCreatedItemIsUsable() {
+        section("Keychain item created by security(1)")
+
+        guard let scratch = scratchKeychain() else {
+            expect(false, "a scratch keychain can be created")
+            return
+        }
+        defer { destroyScratchKeychain(scratch) }
+
+        let service = "headroom-selftest-\(UUID().uuidString)"
+        var reader: SecTrustedApplication?
+        guard SecTrustedApplicationCreateFromPath(Keychain.claudeCodeReaderPath, &reader)
+                == errSecSuccess, let reader,
+              let access = { () -> SecAccess? in
+                  var a: SecAccess?
+                  guard SecAccessCreate(service as CFString, [reader] as CFArray, &a)
+                          == errSecSuccess else { return nil }
+                  return a
+              }() else {
+            expect(false, "an ACL naming only the security tool can be built")
+            return
+        }
+        guard SecItemAdd([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: Keychain.defaultAccount,
+            kSecValueData as String: Data("token-from-claude-login".utf8),
+            kSecAttrAccess as String: access,
+            kSecUseKeychain as String: scratch.keychain,
+        ] as CFDictionary, nil) == errSecSuccess else {
+            expect(false, "an item owned only by the security tool can be planted")
+            return
+        }
+
+        expect(Keychain.claudeCodeCanReadSilently(service: service, in: scratch.keychain) == true,
+               "an item created by security(1) is healthy from Claude Code's side")
+
+        // The write Headroom performs when swapping away from this account. It
+        // must succeed even though Headroom cannot decrypt the item: the encrypt
+        // authorisation is open, which is the property that keeps every write
+        // path prompt-free.
+        do {
+            try Keychain.writeTargeting(Data("swapped-in".utf8), service: service,
+                                        allowInteraction: false,
+                                        sharedWithClaudeCode: true, in: scratch.keychain)
+        } catch {
+            expect(false, "Headroom can overwrite an item it is not trusted to read: \(error)")
+            return
+        }
+
+        expect(Keychain.securityToolCanRead(service: service, keychainPath: scratch.path.path)
+                == Data("swapped-in".utf8),
+               "the swapped-in token is what security(1) reads back")
+    }
+
     // MARK: Harness
+
+    /// A throwaway keychain, so no test ever writes near the real login one.
+    ///
+    /// Unlocked explicitly with the password it was just created with. Without
+    /// this, changing an item's ACL makes macOS ask the user to unlock a keychain
+    /// whose password is a UUID generated in this function and never shown to
+    /// anyone -- an unanswerable dialog, over whatever they were doing.
+    @available(macOS, deprecated: 10.10)
+    private static func scratchKeychain() -> (keychain: SecKeychain, path: URL)? {
+        let path = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "headroom-acl-\(UUID().uuidString).keychain")
+        let password = Array(UUID().uuidString.utf8)
+        var keychain: SecKeychain?
+        guard SecKeychainCreate(
+                path.path, UInt32(password.count), password, false, nil, &keychain)
+                == errSecSuccess,
+              let keychain
+        else { return nil }
+        guard SecKeychainUnlock(keychain, UInt32(password.count), password, true)
+                == errSecSuccess
+        else {
+            SecKeychainDelete(keychain)
+            try? FileManager.default.removeItem(at: path)
+            return nil
+        }
+        return (keychain, path)
+    }
+
+    /// The keychain ACL cases, behind one deprecated door.
+    ///
+    /// Everything below touches the legacy `SecKeychain*` family, which has no
+    /// modern replacement for reading or setting an ACL. Swift only silences a
+    /// deprecation warning inside an equally deprecated context, so the warnings
+    /// have to surface at whichever call site crosses the line. Funnelling the
+    /// cases through here makes that exactly one, instead of one per case.
+    @available(macOS, deprecated: 10.10)
+    private static func keychainAccessControl() {
+        withoutUserInteraction {
+            keychainACL()
+            keychainACLRepair()
+            keychainToolCreatedItemIsUsable()
+            keychainPartitionListIsNotAGate()
+        }
+    }
+
+    /// Runs `body` with macOS forbidden from putting up any keychain dialog.
+    ///
+    /// A belt to the unlock braces above. These tests exercise the exact
+    /// operations that prompt, and a self test that can interrupt the user with a
+    /// password dialog is worse than no self test. With interaction refused, an
+    /// operation that would have prompted fails instead, and the check that
+    /// depended on it fails loudly rather than silently waiting on a human.
+    @available(macOS, deprecated: 10.10)
+    private static func withoutUserInteraction(_ body: () -> Void) {
+        SecKeychainSetUserInteractionAllowed(false)
+        defer { SecKeychainSetUserInteractionAllowed(true) }
+        body()
+    }
+
+    @available(macOS, deprecated: 10.10)
+    private static func destroyScratchKeychain(_ scratch: (keychain: SecKeychain, path: URL)) {
+        SecKeychainDelete(scratch.keychain)
+        try? FileManager.default.removeItem(at: scratch.path)
+    }
+
+    /// Who may read the secret without a prompt, per the decrypt ACL.
+    @available(macOS, deprecated: 10.10)
+    private static func decryptTrustList(
+        service: String,
+        in keychain: SecKeychain
+    ) -> (trusted: Set<String>, allowsEveryApplication: Bool)? {
+        var ref: CFTypeRef?
+        guard SecItemCopyMatching([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: Keychain.defaultAccount,
+            kSecMatchSearchList as String: [keychain] as CFArray,
+            kSecReturnRef as String: true,
+        ] as CFDictionary, &ref) == errSecSuccess,
+              let item = ref,
+              CFGetTypeID(item) == SecKeychainItemGetTypeID()
+        else { return nil }
+
+        var access: SecAccess?
+        // swiftlint:disable:next force_cast
+        guard SecKeychainItemCopyAccess((item as! SecKeychainItem), &access) == errSecSuccess,
+              let access
+        else { return nil }
+
+        var aclsRef: CFArray?
+        guard SecAccessCopyACLList(access, &aclsRef) == errSecSuccess,
+              let acls = aclsRef as? [SecACL]
+        else { return nil }
+
+        var trusted: Set<String> = []
+        var allowsEveryApplication = false
+        for acl in acls {
+            guard let authorizations = SecACLCopyAuthorizations(acl) as? [String],
+                  authorizations.contains(kSecACLAuthorizationDecrypt as String)
+            else { continue }
+
+            var apps: CFArray?
+            var description: CFString?
+            var selector = SecKeychainPromptSelector()
+            guard SecACLCopyContents(acl, &apps, &description, &selector) == errSecSuccess
+            else { continue }
+            guard let apps = apps as? [SecTrustedApplication] else {
+                allowsEveryApplication = true
+                continue
+            }
+            for app in apps {
+                var data: CFData?
+                guard SecTrustedApplicationCopyData(app, &data) == errSecSuccess,
+                      let data = data as Data?
+                else { continue }
+                trusted.insert(String(decoding: data, as: UTF8.self)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\0")))
+            }
+        }
+        return (trusted, allowsEveryApplication)
+    }
 
     private static func section(_ name: String) {
         print("")
