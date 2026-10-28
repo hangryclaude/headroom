@@ -138,7 +138,7 @@ enum IconRenderer {
             width: tankW,
             height: tankH
         )
-        let tankRadius = tankW / 2
+        let tankRadius = max(1.5, tankW * 0.12)
 
         ctx.saveGState()
         CGPath(roundedRect: tank, cornerWidth: tankRadius, cornerHeight: tankRadius,
@@ -155,12 +155,41 @@ enum IconRenderer {
         ctx.fill(CGRect(x: tank.minX, y: tank.minY,
                         width: tank.width, height: tank.height * fill))
 
-        // The pace tick: where spend should be. Sits above the fill here, so the
-        // mark reads as "ahead of budget" -- the state worth designing for.
+        // The pace tick: a notch cut from one edge rather than a seam painted
+        // across the whole tank, so it reads as an instrument mark instead of a
+        // capsule join.
         let tickY = tank.minY + tank.height * 0.56
-        let tickH = max(s * 0.026, 1.5)
+        let notchH = max(s * 0.034, 2)
+        let notchW = max(tank.width * 0.28, 3)
+        let notch = CGRect(
+            x: tank.maxX - notchW,
+            y: tickY - notchH / 2,
+            width: notchW,
+            height: notchH
+        )
+        // Repaint the tile's own gradient inside the notch rather than clearing
+        // it. `.clear` looks identical in a preview and is wrong: the tile
+        // background is already down by this point, so erasing punches a
+        // transparent hole straight through the icon and the desktop shows
+        // through the gauge in Finder and the Dock.
+        ctx.saveGState()
+        ctx.clip(to: notch)
+        ctx.drawLinearGradient(
+            gradient,
+            start: CGPoint(x: 0, y: s), end: CGPoint(x: 0, y: 0),
+            options: []
+        )
+        ctx.restoreGState()
+
+        let tickH = max(s * 0.018, 1.5)
+        let tick = CGRect(
+            x: notch.minX,
+            y: notch.midY - tickH / 2,
+            width: max(notch.width - max(s * 0.016, 1), 1),
+            height: tickH
+        )
         ctx.setFillColor(CGColor(red: 0.93, green: 0.58, blue: 0.20, alpha: 1))
-        ctx.fill(CGRect(x: tank.minX, y: tickY, width: tank.width, height: tickH))
+        ctx.fill(tick)
 
         ctx.restoreGState()
         ctx.restoreGState()
