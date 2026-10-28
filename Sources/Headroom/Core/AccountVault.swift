@@ -32,6 +32,7 @@ enum VaultError: Error, CustomStringConvertible {
     case noCredentials
     case cannotReadOutgoing(String)
     case duplicateAccount(existing: String, email: String)
+    case refreshInFlight(String)
 
     var description: String {
         switch self {
@@ -47,6 +48,8 @@ enum VaultError: Error, CustomStringConvertible {
         case .cannotReadOutgoing(let why):
             // Never overwrite a credential we could not first save a copy of.
             return "refusing to swap — cannot read the current account (\(why))"
+        case .refreshInFlight(let n):
+            return "a token refresh for \(n) is in flight — try again in a moment"
         }
     }
 }
@@ -276,6 +279,13 @@ final class AccountVault: @unchecked Sendable {
     /// its lock, its pre-call backup, and the raw rotated response.
     func directory(for account: StoredAccount) -> URL {
         root.appending(path: account.name)
+    }
+
+    /// The mutex `TokenRefresher` holds while it redeems this account's refresh
+    /// token. `activate` takes the same one, so a swap and a refresh of the same
+    /// account can never interleave.
+    func refreshLock(for name: String) -> URL {
+        root.appending(path: name).appending(path: TokenRefresher.lockFileName)
     }
 
     /// The stored blob. The active account is read live instead, so a token
@@ -512,6 +522,20 @@ final class AccountVault: @unchecked Sendable {
             throw VaultError.sessionsBusy(verdict.sessions)
         }
 
+        // Hold the target's refresh mutex for the whole swap. Without it, a
+        // background refresh of the dormant account could be mid-redemption
+        // while its *pre-rotation* blob is read below and installed into the
+        // Keychain; the rotated pair then lands in the vault file only, and
+        // Claude Code is left holding a refresh token the server has already
+        // consumed -- which revokes the account rather than logging it out.
+        // The lock is a file, so this also covers the CLI swapping while the
+        // menu bar app is refreshing, which no in-process flag can see.
+        let targetLock = refreshLock(for: name)
+        guard let targetOwnership = TokenRefresher.acquireLock(targetLock) else {
+            throw VaultError.refreshInFlight(name)
+        }
+        defer { TokenRefresher.releaseLock(targetLock, ownership: targetOwnership) }
+
         guard let target = storedCredentials(name), target.accessToken != nil else {
             throw VaultError.noCredentials
         }
@@ -534,6 +558,26 @@ final class AccountVault: @unchecked Sendable {
         }
 
         if isActive(list[targetIndex]) { throw VaultError.alreadyActive(name) }
+
+        // Same mutex for the outgoing side, taken before its live credential is
+        // read so the snapshot persisted below cannot be overtaken by a rotation
+        // that started a moment earlier. Resolved here, ahead of the read, for
+        // that reason; the name is a pure function of the vault files.
+        let currentName = resolvedActiveName(among: list)
+        var outgoingLock: (url: URL, ownership: String)?
+        if let currentName, currentName != name,
+           list.contains(where: { $0.name == currentName }) {
+            let url = refreshLock(for: currentName)
+            guard let ownership = TokenRefresher.acquireLock(url) else {
+                throw VaultError.refreshInFlight(currentName)
+            }
+            outgoingLock = (url, ownership)
+        }
+        defer {
+            if let outgoingLock {
+                TokenRefresher.releaseLock(outgoingLock.url, ownership: outgoingLock.ownership)
+            }
+        }
 
         // Read the outgoing credential up front, and refuse the swap if it
         // cannot be read.
@@ -569,7 +613,6 @@ final class AccountVault: @unchecked Sendable {
         // outgoing account matched nothing and its live credential was written
         // only into a dated backup directory nobody looks in. Rule 1 exists to
         // stop exactly the loss that then followed.
-        let currentName = resolvedActiveName(among: list)
         if let outgoingIndex = list.firstIndex(where: { $0.name == currentName }) {
             try persist(live, for: list[outgoingIndex].name)
             list[outgoingIndex].fingerprint = live.fingerprint

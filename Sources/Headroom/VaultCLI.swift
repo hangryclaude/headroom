@@ -76,7 +76,7 @@ enum VaultCLI {
         case "waste":
             waste(vault)
         default:
-            print("usage: Headroom --vault <status|list|login <name>|import <name> <file>|save <name>|switch <name>|forget <name>|usage|refresh-identity>")
+            print("usage: Headroom --vault <status|list|login <name>|login-url <name>|login-code <name> <code>|import <name> <file>|save <name>|switch <name>|forget <name>|usage|refresh-identity|waste>")
         }
     }
 

@@ -155,12 +155,19 @@ enum Keychain {
     /// the cases where a prompt is possible, so `allowInteraction` still
     /// governs, and background callers still get a clean refusal instead of a
     /// modal over whatever the user is doing.
+    ///
+    /// The ACL is not the only gate, though: a *locked* keychain makes
+    /// `security` raise the unlock dialog whatever the ACL says, and that
+    /// dialog belongs to SecurityAgent, so killing the child on timeout leaves
+    /// it on screen. Background callers therefore skip the tool whenever the
+    /// keychain is locked and take the framework path, which refuses cleanly.
     static func read(
         service: String = ClaudePaths.keychainService,
         account: String = defaultAccount,
         allowInteraction: Bool = true
     ) throws -> Data {
-        if let data = readViaTrustedSecurityTool(service: service, account: account) {
+        if allowInteraction || defaultKeychainIsUnlocked(),
+           let data = readViaTrustedSecurityTool(service: service, account: account) {
             return data
         }
 
@@ -207,6 +214,18 @@ enum Keychain {
     private static func readViaTrustedSecurityTool(service: String, account: String) -> Data? {
         guard securityToolIsTrusted(service: service, account: account) == true else { return nil }
         return readViaSecurityTool(service: service, account: account, in: nil)
+    }
+
+    /// Whether the default (login) keychain is unlocked right now.
+    ///
+    /// A status read, never a prompt. Treats an error as "locked", because the
+    /// only caller uses the answer to decide whether a prompt is impossible,
+    /// and "unknown" is not the same as "impossible".
+    @available(macOS, deprecated: 10.10)
+    static func defaultKeychainIsUnlocked() -> Bool {
+        var status = SecKeychainStatus()
+        guard SecKeychainGetStatus(nil, &status) == errSecSuccess else { return false }
+        return status & SecKeychainStatus(kSecUnlockStateStatus) != 0
     }
 
     /// The same command Claude Code runs, for the same reason.

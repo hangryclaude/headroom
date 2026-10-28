@@ -348,7 +348,10 @@ enum SelfTest {
         defer { try? FileManager.default.removeItem(at: copy) }
 
         do {
+            // The copy carries whatever the real file does -- MCP server
+            // credentials included -- so it is owner-only for its short life.
             try original.write(to: copy)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: copy.path)
             try AccountVault.repointConfig(at: copy)
         } catch {
             expect(false, "the surgery runs without throwing: \(error)")
@@ -788,6 +791,43 @@ enum SelfTest {
         }
         expect(storedToken(f6, AccountVault.unsavedSlot)?.contains("live-a") == true,
                "an unrecognised outgoing credential is parked rather than discarded")
+
+        // 7. A refresh in flight for either side of the swap refuses it. The
+        //    refresher's mutex is a file, so this is what stops the CLI from
+        //    installing a pre-rotation token while the app is mid-redemption.
+        guard let f7 = makeFixture() else { expect(false, "a fifth fixture builds"); return }
+        defer { try? FileManager.default.removeItem(at: f7.root) }
+        let before7 = f7.store.data
+        let targetLock = f7.vault.refreshLock(for: "b")
+        guard let held = TokenRefresher.acquireLock(targetLock) else {
+            expect(false, "the target's refresh lock can be taken"); return
+        }
+        if case .some = try? f7.vault.activate("b") {
+            expect(false, "a swap to an account whose token is being refreshed is refused")
+        } else {
+            expect(true, "a swap to an account whose token is being refreshed is refused")
+        }
+        expect(f7.store.data == before7, "the refused swap installed nothing")
+        TokenRefresher.releaseLock(targetLock, ownership: held)
+
+        let outgoingLock = f7.vault.refreshLock(for: "a")
+        guard let heldOutgoing = TokenRefresher.acquireLock(outgoingLock) else {
+            expect(false, "the outgoing account's refresh lock can be taken"); return
+        }
+        if case .some = try? f7.vault.activate("b") {
+            expect(false, "a swap away from an account whose token is being refreshed is refused")
+        } else {
+            expect(true, "a swap away from an account whose token is being refreshed is refused")
+        }
+        expect(f7.store.data == before7, "the refused swap left the outgoing token in place")
+        TokenRefresher.releaseLock(outgoingLock, ownership: heldOutgoing)
+
+        guard (try? f7.vault.activate("b")) != nil else {
+            expect(false, "once both locks are free the same swap succeeds"); return
+        }
+        expect(!FileManager.default.fileExists(atPath: targetLock.path)
+               && !FileManager.default.fileExists(atPath: outgoingLock.path),
+               "the swap releases both refresh locks when it is done")
     }
 
     private static func backfill() {
@@ -1121,6 +1161,20 @@ enum SelfTest {
         let emptyEnvelope = #"{"items":[],"end_cursor":null,"has_next_page":false,"total":0}"#
         expect((try? DevinClient.parse(Data(emptyEnvelope.utf8)))?.isEmpty == true,
                "an empty org parses to an empty list, not an error")
+
+        // The bare-array shape the parser claims to tolerate. It used to cast
+        // the root to a dictionary first, so a list threw `malformed`.
+        let bareArray = #"[{"session_id":"s-9","status":"running","acus_consumed":1}]"#
+        expect((try? DevinClient.parse(Data(bareArray.utf8)))?.count == 1,
+               "a bare array of sessions parses as one page")
+
+        // The cursor rides along, because ACUs are summed from the whole list.
+        let paged = #"{"items":[{"session_id":"s-1"}],"end_cursor":"c-1","has_next_page":true}"#
+        let page = try? DevinClient.parsePage(Data(paged.utf8))
+        expect(page?.hasNextPage == true && page?.endCursor == "c-1",
+               "a page that has more reports its cursor")
+        expect((try? DevinClient.parsePage(Data(emptyEnvelope.utf8)))?.hasNextPage == false,
+               "the last page reports no cursor")
     }
 
     /// The access control list on a credentials item Headroom had to create.

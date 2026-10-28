@@ -45,6 +45,10 @@ struct TokenRefresher {
     /// A lock older than this is assumed to belong to a dead process.
     static let lockTimeout: TimeInterval = 2 * 60
 
+    /// Lives inside the account's vault directory. `AccountVault.activate`
+    /// takes the same file, which is how a swap and a refresh exclude each other.
+    static let lockFileName = ".refresh.lock"
+
     var session: URLSession = .shared
 
     /// - Parameter persist: called with the rotated credentials **while the mutex
@@ -68,7 +72,7 @@ struct TokenRefresher {
 
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
-        let lock = directory.appending(path: ".refresh.lock")
+        let lock = directory.appending(path: Self.lockFileName)
         guard let ownership = Self.acquireLock(lock) else { return .busy }
         defer { Self.releaseLock(lock, ownership: ownership) }
 

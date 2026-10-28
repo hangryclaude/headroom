@@ -45,16 +45,55 @@ struct DevinClient {
     /// - Parameter orgID: the `org-…` identifier from Settings ▸ Service Users.
     ///   The bare UUID does not work; the endpoint answers "Organization not
     ///   found" for it, which is indistinguishable from a wrong org.
-    func fetchSessions(orgID: String, apiKey: String, limit: Int = 20) async throws -> [DevinSession] {
+    ///
+    /// Walks every page. ACUs are summed from this list, so a single page would
+    /// under-report any org with more sessions than fit in one -- silently, and
+    /// in the direction that says there is more room than there is.
+    func fetchSessions(orgID: String, apiKey: String, pageSize: Int = Self.pageSize)
+        async throws -> [DevinSession]
+    {
         guard !apiKey.isEmpty else { throw Failure.noKey }
         guard !orgID.isEmpty else { throw Failure.noOrg }
 
+        var sessions: [DevinSession] = []
+        var after: String?
+        for _ in 0..<Self.maxPages {
+            let page = try await fetchPage(orgID: orgID, apiKey: apiKey, first: pageSize, after: after)
+            sessions += page.sessions
+            guard page.hasNextPage, let cursor = page.endCursor, cursor != after else { break }
+            after = cursor
+        }
+        return sessions
+    }
+
+    /// The schema's maximum for `first`.
+    static let pageSize = 200
+
+    /// Bounds the walk so a server that keeps answering `has_next_page` cannot
+    /// pin the dropdown open forever. Ten pages of 200 is far past any
+    /// self-serve org.
+    static let maxPages = 10
+
+    struct Page {
+        var sessions: [DevinSession]
+        var endCursor: String?
+        var hasNextPage: Bool
+    }
+
+    private func fetchPage(
+        orgID: String, apiKey: String, first: Int, after: String?
+    ) async throws -> Page {
         var components = URLComponents(string: "\(Self.host)/v3/organizations/\(orgID)/sessions")!
         // `qs` is documented as a required SessionsQueryParams object but the
-        // endpoint answers 200 without it. Sending it as JSON is the documented
-        // shape and pins the page size; the bare call was verified to work too,
-        // so a rejection here is not fatal to the feature.
-        components.queryItems = [URLQueryItem(name: "qs", value: #"{"limit":\#(limit)}"#)]
+        // endpoint answers 200 without it. Its page-size field is `first`
+        // (1...200, default 100) and its cursor is `after`; an earlier build
+        // sent `limit`, which the schema does not define and the server
+        // ignored, so the "page size" it believed it had pinned was never
+        // applied.
+        var query: [String: Any] = ["first": first]
+        if let after { query["after"] = after }
+        let encoded = String(decoding: try! JSONSerialization.data(withJSONObject: query), as: UTF8.self)
+        components.queryItems = [URLQueryItem(name: "qs", value: encoded)]
 
         var request = URLRequest(url: components.url!)
         request.httpMethod = "GET"
@@ -74,7 +113,7 @@ struct DevinClient {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         switch status {
         case 200..<300:
-            return try Self.parse(data)
+            return try Self.parsePage(data)
         case 401, 403:
             throw Failure.unauthorized
         case 404:
@@ -95,14 +134,29 @@ struct DevinClient {
     /// to match `UsageClient` and to keep a single unexpected field from
     /// invalidating the whole response.
     static func parse(_ data: Data) throws -> [DevinSession] {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { throw Failure.malformed }
+        try parsePage(data).sessions
+    }
 
-        // Accept a bare array too: the envelope is documented, but an endpoint
-        // that once returned a list directly is cheap to keep tolerating.
-        let items = (root["items"] as? [[String: Any]]) ?? []
+    /// The envelope plus its cursor. A bare array is accepted too: the envelope
+    /// is documented, but an endpoint that once returned a list directly is
+    /// cheap to keep tolerating -- and it is one page with nothing after it.
+    static func parsePage(_ data: Data) throws -> Page {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else { throw Failure.malformed }
 
-        return items.compactMap { item in
+        let items: [[String: Any]]
+        var endCursor: String?
+        var hasNextPage = false
+        if let root = json as? [String: Any] {
+            items = (root["items"] as? [[String: Any]]) ?? []
+            endCursor = root["end_cursor"] as? String
+            hasNextPage = root["has_next_page"] as? Bool ?? false
+        } else if let list = json as? [[String: Any]] {
+            items = list
+        } else {
+            throw Failure.malformed
+        }
+
+        let sessions: [DevinSession] = items.compactMap { item in
             // session_id is required by the schema; an item without one is not a
             // session we can link to, so drop it rather than invent an id.
             guard let id = item["session_id"] as? String else { return nil }
@@ -119,6 +173,7 @@ struct DevinClient {
                 isArchived: item["is_archived"] as? Bool ?? false
             )
         }
+        return Page(sessions: sessions, endCursor: endCursor, hasNextPage: hasNextPage)
     }
 
     /// The schema says the timestamps are integers but not what unit. Claude's

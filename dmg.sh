@@ -21,7 +21,7 @@ VOLNAME="Headroom"
 
 # Single source of truth: build.sh stamps the Info.plist, so read the version
 # back out of it rather than keeping a second copy here that can drift.
-VERSION="$(grep -m1 '^VERSION=' build.sh | cut -d'"' -f2)"
+VERSION="$(sed -n -E "s/^VERSION=[\"']?([^\"' ]+).*/\1/p" build.sh | head -n1)"
 if [[ -z "$VERSION" ]]; then
     echo "dmg.sh: could not read VERSION from build.sh" >&2
     exit 1
