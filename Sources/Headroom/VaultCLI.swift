@@ -466,12 +466,14 @@ enum VaultCLI {
             return
         }
 
-        // Resolve every token up front so the detached task captures only plain
-        // strings. Reaching into the vault from inside the closure would make it
-        // a `sending` violation under Swift 6 concurrency checking.
-        let tokens: [(name: String, token: String?)] = accounts.map {
-            ($0.name, vault.accessToken(for: $0))
-        }
+        // Resolve every credential up front so the detached task captures only
+        // values. The active account is read live (Keychain, may prompt once);
+        // the rest come off disk and are refreshed below the way the app does
+        // it, because a dormant account's access token is expired by
+        // definition and "token expired" for every row is not a usage report.
+        let activeName = vault.activeAccount()?.name
+        let entries: [(account: StoredAccount, credentials: Credentials?, isActive: Bool)] =
+            accounts.map { ($0, vault.credentials(for: $0), $0.name == activeName) }
 
         let done = DispatchSemaphore(value: 0)
 
@@ -480,18 +482,45 @@ enum VaultCLI {
         // binary links AppKit, so a plain `Task` would be main-actor bound.
         Task.detached {
             let client = UsageClient()
-            for entry in tokens {
-                guard let token = entry.token else {
-                    print("  \(entry.name.padded(16)) no token")
+            let refresher = TokenRefresher()
+            for entry in entries {
+                let name = entry.account.name
+                guard let stored = entry.credentials, stored.accessToken != nil else {
+                    print("  \(name.padded(16)) no token")
                     continue
                 }
+
+                // Never redeem the active account's refresh token from here:
+                // Claude Code owns that item and rotates it itself.
+                func usable(force: Bool) async -> String? {
+                    if entry.isActive { return stored.accessToken }
+                    switch await refresher.refreshIfNeeded(
+                        stored, directory: vault.directory(for: entry.account), force: force,
+                        persist: { try vault.replaceCredentials($0, for: entry.account) }
+                    ) {
+                    case .refreshed(let updated):   return updated.accessToken
+                    case .needsLogin(let why):      print("  \(name.padded(16)) needs login — \(why)"); return nil
+                    case .failed(let why):          print("  \(name.padded(16)) refresh failed — \(why)"); return nil
+                    case .stillValid, .busy, .rateLimited: return stored.accessToken
+                    }
+                }
+
+                guard var token = await usable(force: false) else { continue }
                 do {
-                    let snapshot = try await client.fetch(accessToken: token)
+                    var snapshot: QuotaSnapshot
+                    do {
+                        snapshot = try await client.fetch(accessToken: token)
+                    } catch UsageClient.Failure.tokenExpired where !entry.isActive {
+                        // The server is authoritative over the stored expiry.
+                        guard let renewed = await usable(force: true) else { continue }
+                        token = renewed
+                        snapshot = try await client.fetch(accessToken: token)
+                    }
                     let p5 = snapshot.session?.reading.percent.map { "\($0)%" } ?? "—"
                     let p7 = snapshot.weekly?.reading.percent.map { "\($0)%" } ?? "—"
-                    print("  \(entry.name.padded(16)) 5h \(p5.padded(6)) 7d \(p7)")
+                    print("  \(name.padded(16)) 5h \(p5.padded(6)) 7d \(p7)")
                 } catch {
-                    print("  \(entry.name.padded(16)) \(error)")
+                    print("  \(name.padded(16)) \(error)")
                 }
             }
             done.signal()

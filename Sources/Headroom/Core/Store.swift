@@ -107,6 +107,15 @@ final class Store {
     var settings: Settings { didSet { settings.save() } }
 
     private let reader = QuotaReader()
+
+    /// The active account's quota straight from the usage endpoint.
+    ///
+    /// Claude Code 2.1.x stopped writing `cachedUsageUtilization` to
+    /// `~/.claude.json`, which was the only source the headline read -- so on
+    /// a current install the menu bar said "run Claude Code once" forever. The
+    /// file is still preferred when it has something, because Claude Code's
+    /// own read is free; this is what stands in when it has nothing.
+    private var liveQuota: QuotaSnapshot?
     private let sessions = SessionGuard()
     private let identities = IdentityReader()
     private let indexer = TranscriptIndexer()
@@ -266,13 +275,8 @@ final class Store {
 
     func refresh() {
         now = Date()
-        do {
-            quota = try reader.read(now: now)
-            quotaError = nil
-        } catch {
-            quota = nil
-            quotaError = String(describing: error)
-        }
+        (quota, quotaError) = Self.resolveQuota(
+            disk: Result { try reader.read(now: now) }, live: liveQuota)
         verdict = sessions.verdict()
         identity = identities.read()
         accounts = vault.accounts()
@@ -282,6 +286,22 @@ final class Store {
         // session the user is actually in.
         modelRaw = ModelSetting.raw()
         recomputeDecision()
+    }
+
+    /// Which reading the headline shows: the fresher of Claude Code's on-disk
+    /// cache and our own fetch, and the disk error only when neither exists.
+    /// Pure, so `--selftest` can pin the choice down.
+    nonisolated static func resolveQuota(
+        disk: Result<QuotaSnapshot, Error>, live: QuotaSnapshot?
+    ) -> (QuotaSnapshot?, String?) {
+        switch disk {
+        case .success(let cached):
+            if let live, live.fetchedAt > cached.fetchedAt { return (live, nil) }
+            return (cached, nil)
+        case .failure(let error):
+            if let live { return (live, nil) }
+            return (nil, String(describing: error))
+        }
     }
 
     /// What `~/.claude/settings.json` says, verbatim. nil when unset.
@@ -337,6 +357,8 @@ final class Store {
         isFetchingUsage = true
         defer { isFetchingUsage = false }
 
+        await refreshActiveQuota(force: force)
+
         for account in accounts where account.name != activeAccountName {
             let cached = usage[account.name]
             if !force, let fetchedAt = cached?.fetchedAt,
@@ -385,6 +407,32 @@ final class Store {
             }
         }
         recomputeDecision()
+    }
+
+    /// The headline reading when `~/.claude.json` has none to offer.
+    ///
+    /// Only when the file has nothing (or is stale): a cache Claude Code wrote
+    /// a moment ago is as good as a fetch and costs no request. The active
+    /// account's refresh token is never redeemed here -- Claude Code owns that
+    /// item and rotates it itself, and redeeming it from outside is how a
+    /// token family gets revoked. An expired access token simply waits for
+    /// Claude Code's next run, and the popover says so.
+    private func refreshActiveQuota(force: Bool) async {
+        let diskIsUsable = (try? reader.read(now: now)).map { !$0.isStale(now: now) } ?? false
+        if diskIsUsable && !force { return }
+        if !force, let fetchedAt = liveQuota?.fetchedAt,
+           now.timeIntervalSince(fetchedAt) < Self.usageTTL { return }
+        guard let token = vault.liveAccessToken(allowInteraction: false) else { return }
+
+        do {
+            liveQuota = try await usageClient.fetch(accessToken: token)
+        } catch UsageClient.Failure.tokenExpired {
+            liveQuota = nil
+        } catch {
+            Diag.log("usage: active account fetch failed — \(error)")
+            return
+        }
+        refresh()
     }
 
     /// A live access token for an inactive account, refreshing it first if it has
@@ -605,6 +653,8 @@ final class Store {
             try vault.activate(
                 name, force: force, allowKeychainPrompt: allowKeychainPrompt)
             lastSwapError = nil
+            // The live reading belonged to the account just swapped out.
+            liveQuota = nil
             refresh()
             Task { await refreshUsage(force: true) }
         } catch {

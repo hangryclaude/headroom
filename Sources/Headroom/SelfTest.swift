@@ -296,6 +296,23 @@ enum SelfTest {
     private static func quotaRollover() {
         section("Quota")
 
+        // The headline's source of truth. Claude Code 2.1.x stopped writing
+        // the on-disk cache, so the live reading must stand in -- and when
+        // both exist, the fresher one wins.
+        let older = QuotaSnapshot(fetchedAt: Date(timeIntervalSince1970: 100), accountUUID: nil, limits: [])
+        let newer = QuotaSnapshot(fetchedAt: Date(timeIntervalSince1970: 200), accountUUID: nil, limits: [])
+        let missing = Result<QuotaSnapshot, Error>.failure(QuotaError.noUsageCache)
+        expect(Store.resolveQuota(disk: missing, live: nil).0 == nil
+               && Store.resolveQuota(disk: missing, live: nil).1 != nil,
+               "no cache and no live reading reports the disk error")
+        expect(Store.resolveQuota(disk: missing, live: older).0?.fetchedAt == older.fetchedAt
+               && Store.resolveQuota(disk: missing, live: older).1 == nil,
+               "no cache falls back to the live reading with no error")
+        expect(Store.resolveQuota(disk: .success(older), live: newer).0?.fetchedAt == newer.fetchedAt,
+               "a fresher live reading beats a staler cache")
+        expect(Store.resolveQuota(disk: .success(newer), live: older).0?.fetchedAt == newer.fetchedAt,
+               "a fresher cache beats a staler live reading")
+
         let now = Date()
         // A window whose reset has already passed: the percentage on disk
         // describes a window that no longer exists.

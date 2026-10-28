@@ -332,6 +332,16 @@ final class AccountVault: @unchecked Sendable {
         credentials(for: account)?.accessToken
     }
 
+    /// The signed-in account's access token, for the usage endpoint.
+    ///
+    /// With `allowInteraction: false` this cannot raise a dialog: the read goes
+    /// through `security(1)` when the ACL admits it and refuses cleanly when it
+    /// does not. That is what lets the background tick ask the endpoint about
+    /// the active account without stalling the menu bar on a password prompt.
+    func liveAccessToken(allowInteraction: Bool) -> String? {
+        (try? currentCredentials(allowInteraction: allowInteraction))?.accessToken
+    }
+
     /// Access token from the vault's own copy, never the Keychain.
     ///
     /// Read-only reporting commands use this deliberately. A command whose entire
