@@ -2,11 +2,13 @@
 
 <img src="docs/icon.png" width="104" alt="Headroom's app icon: a tank filled from the bottom with a pace notch cut into the right edge">
 
-# Headroom
+# 📊 Headroom
 
 **Claude Code quota in your macOS menu bar — and one click to the account that still has room.**
 
 Swift 6 · SwiftUI · AppKit · no dependencies · macOS 14+ (Apple silicon)
+
+<img src="docs/banner.png" alt="headroom — generated title banner" width="832">
 
 </div>
 
